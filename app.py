@@ -28,7 +28,6 @@ for m in markets:
         "trade_direction": None,
         "step": 0,
         "profit": 0,
-
         "entry_price": None,
         "entry_time": None,
         "current_bet": 0,
@@ -36,7 +35,7 @@ for m in markets:
     }
 
 # =========================
-# TIME SYNC
+# TIME
 # =========================
 def wait_for_next_candle():
     now = datetime.now(timezone.utc)
@@ -70,7 +69,7 @@ def get_last_two_closes(market):
     return previous, latest
 
 # =========================
-# BOT LOGIC
+# BOT
 # =========================
 def run_market(m):
     global bankroll
@@ -84,7 +83,6 @@ def run_market(m):
                 time.sleep(5)
                 continue
 
-            # Direction
             if last_close > prev_close:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
@@ -92,7 +90,6 @@ def run_market(m):
                 s["down_streak"] += 1
                 s["up_streak"] = 0
 
-            # Entry
             if not s["in_trade"]:
                 if s["up_streak"] >= 3:
                     s["in_trade"] = True
@@ -106,7 +103,6 @@ def run_market(m):
                     s["step"] = 0
                     s["entry_time"] = datetime.now(timezone.utc)
 
-            # Trading loop
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
 
@@ -131,7 +127,7 @@ def run_market(m):
 
                     s["profit"] += profit
 
-                    # Reset
+                    # reset
                     s["in_trade"] = False
                     s["up_streak"] = 0
                     s["down_streak"] = 0
@@ -148,7 +144,6 @@ def run_market(m):
                     s["profit"] -= bet
                     s["step"] += 1
 
-            # Max loss reset
             if s["in_trade"] and s["step"] >= len(stake_levels):
                 s["in_trade"] = False
                 s["up_streak"] = 0
@@ -164,6 +159,14 @@ def run_market(m):
         wait_for_next_candle()
 
 # =========================
+# START THREADS
+# =========================
+def start_bots():
+    for m in markets:
+        t = threading.Thread(target=run_market, args=(m,), daemon=True)
+        t.start()
+
+# =========================
 # WEB UI
 # =========================
 HTML = """
@@ -173,36 +176,12 @@ HTML = """
     <title>Trading Dashboard</title>
     <meta http-equiv="refresh" content="2">
     <style>
-        body {
-            font-family: Arial;
-            background: #0f172a;
-            color: white;
-            padding: 20px;
-        }
+        body { font-family: Arial; background: #0f172a; color: white; padding: 20px; }
         h1 { color: #38bdf8; }
-
-        .bank {
-            font-size: 26px;
-            margin-bottom: 10px;
-        }
-
-        .countdown {
-            font-size: 18px;
-            margin-bottom: 20px;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-        }
-
-        .card {
-            background: #1e293b;
-            padding: 15px;
-            border-radius: 12px;
-        }
-
+        .bank { font-size: 26px; margin-bottom: 10px; }
+        .countdown { font-size: 18px; margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        .card { background: #1e293b; padding: 15px; border-radius: 12px; }
         .green { color: #22c55e; }
         .red { color: #ef4444; }
         .yellow { color: #facc15; }
@@ -211,51 +190,41 @@ HTML = """
 </head>
 <body>
 
-<h1>📊 Trading Dashboard (5-min aligned)</h1>
+<h1>📊 Trading Dashboard</h1>
 
 <div class="bank">💰 Bankroll: ${{ bankroll }}</div>
-
-<div class="countdown">
-    ⏱ Next candle in: <b>{{ countdown }}</b>
-</div>
+<div class="countdown">⏱ Next candle: <b>{{ countdown }}</b></div>
 
 <div class="grid">
 {% for m, s in state.items() %}
 <div class="card">
-    <h2>{{ m }}</h2>
+<h2>{{ m }}</h2>
 
-    <p><b>Streak:</b> U:{{ s.up_streak }} | D:{{ s.down_streak }}</p>
+<p><b>Streak:</b> U:{{ s.up_streak }} | D:{{ s.down_streak }}</p>
 
-    <p><b>Status:</b>
-    {% if s.in_trade %}
-        <span class="yellow">
-            TRADING {{ s.trade_direction }} (Step {{ s.step+1 }})
-        </span><br>
+<p>
+<b>Status:</b><br>
+{% if s.in_trade %}
+<span class="yellow">TRADING {{ s.trade_direction }} (Step {{ s.step+1 }})</span><br>
+Bet: ${{ s.current_bet }}<br>
+Expected Profit: <span class="green">+${{ "%.2f"|format(s.expected_profit) }}</span><br>
+Return: ${{ "%.2f"|format(s.current_bet + s.expected_profit) }}<br>
+Entry: {{ s.entry_price }}<br>
+Time: {{ s.entry_time }}
+{% else %}
+<span class="idle">IDLE</span>
+{% endif %}
+</p>
 
-        <b>Bet:</b> ${{ s.current_bet }} <br>
+<p>
+<b>Profit:</b>
+{% if s.profit >= 0 %}
+<span class="green">{{ "%.2f"|format(s.profit) }}</span>
+{% else %}
+<span class="red">{{ "%.2f"|format(s.profit) }}</span>
+{% endif %}
+</p>
 
-        <b>Expected Profit:</b>
-        <span class="green">
-            +${{ "%.2f"|format(s.expected_profit) }}
-        </span><br>
-
-        <b>Total Return:</b>
-        ${{ "%.2f"|format(s.current_bet + s.expected_profit) }}<br>
-
-        <b>Entry Price:</b> {{ s.entry_price }} <br>
-        <b>Started:</b> {{ s.entry_time }}
-    {% else %}
-        <span class="idle">IDLE</span>
-    {% endif %}
-    </p>
-
-    <p><b>Profit:</b>
-        {% if s.profit >= 0 %}
-            <span class="green">{{ "%.2f"|format(s.profit) }}</span>
-        {% else %}
-            <span class="red">{{ "%.2f"|format(s.profit) }}</span>
-        {% endif %}
-    </p>
 </div>
 {% endfor %}
 </div>
@@ -274,10 +243,6 @@ def dashboard():
     )
 
 # =========================
-# START
+# INIT (IMPORTANT FOR RENDER)
 # =========================
-if __name__ == "__main__":
-    for m in markets:
-        threading.Thread(target=run_market, args=(m,), daemon=True).start()
-
-    app.run(host="0.0.0.0", port=5000, debug=False)
+start_bots()
