@@ -3,7 +3,6 @@ import time
 import threading
 from datetime import datetime, timezone
 from flask import Flask, render_template_string
-import os
 
 # =========================
 # SETTINGS
@@ -73,13 +72,16 @@ def run_market(m):
 
     while True:
         try:
+            # 🔥 FIX: WAIT FIRST (critical)
+            wait_for_next_candle()
+            time.sleep(2)  # ensure fresh candle data
+
             prev_close, last_close = get_last_two_closes(m)
 
             if prev_close is None:
-                time.sleep(5)
                 continue
 
-            # ORIGINAL LOGIC (unchanged)
+            # ORIGINAL STREAK LOGIC
             if last_close > prev_close:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
@@ -101,7 +103,7 @@ def run_market(m):
                     s["step"] = 0
                     s["entry_time"] = datetime.now(timezone.utc)
 
-            # TRADING
+            # TRADING LOOP
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
 
@@ -110,6 +112,7 @@ def run_market(m):
                 s["entry_price"] = prev_close
 
                 wait_for_next_candle()
+                time.sleep(2)
 
                 prev_close, new_close = get_last_two_closes(m)
 
@@ -151,8 +154,6 @@ def run_market(m):
 
         except:
             pass
-
-        wait_for_next_candle()
 
 # =========================
 # START THREADS
