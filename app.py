@@ -31,7 +31,7 @@ for m in markets:
         "entry_time": None,
         "current_bet": 0,
         "expected_profit": 0,
-        "last_update": "starting..."
+        "last_update": "Starting..."
     }
 
 # =========================
@@ -40,8 +40,7 @@ for m in markets:
 def wait_for_next_candle():
     now = datetime.now(timezone.utc)
     seconds = now.minute * 60 + now.second
-    wait = 300 - (seconds % 300)
-    return wait
+    return 300 - (seconds % 300)
 
 def get_countdown():
     now = datetime.now(timezone.utc)
@@ -77,9 +76,8 @@ def run_market(m):
 
     while True:
         try:
-            # WAIT for next candle FIRST
+            # WAIT FOR CANDLE CLOSE
             wait = wait_for_next_candle()
-            print(f"{m} waiting {wait}s")
             time.sleep(wait + 2)
 
             prev_close, last_close = get_last_two_closes(m)
@@ -88,7 +86,7 @@ def run_market(m):
                 s["last_update"] = "No data"
                 continue
 
-            # Update heartbeat
+            # HEARTBEAT
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
             # STREAK LOGIC
@@ -168,14 +166,18 @@ def run_market(m):
             print("THREAD ERROR:", e)
 
 # =========================
-# START BOTS (FIXED)
+# START BOTS (FIXED FOR RENDER)
 # =========================
-def start_bots():
-    print("STARTING ALL BOTS...")
-    for m in markets:
-        threading.Thread(target=run_market, args=(m,), daemon=True).start()
+bots_started = False
 
-start_bots()
+@app.before_request
+def ensure_bots_started():
+    global bots_started
+    if not bots_started:
+        print("🔥 STARTING BOTS NOW...")
+        for m in markets:
+            threading.Thread(target=run_market, args=(m,), daemon=True).start()
+        bots_started = True
 
 # =========================
 # UI
