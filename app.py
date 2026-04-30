@@ -1,6 +1,8 @@
 import requests
 import time
 import threading
+import json
+import os
 from datetime import datetime, timezone
 from flask import Flask, render_template_string
 
@@ -10,17 +12,43 @@ from flask import Flask, render_template_string
 markets = ["BTC-USD", "ETH-USD", "XRP-USD", "SOL-USD"]
 stake_levels = [4, 8, 16]
 
+STATE_FILE = "state.json"
+
 bankroll = 100
 bankroll_lock = threading.Lock()
 
 app = Flask(__name__)
 
 # =========================
+# LOAD / SAVE
+# =========================
+def save_state():
+    data = {
+        "bankroll": bankroll,
+        "state": state
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+def load_state():
+    global bankroll, state
+
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                bankroll = data.get("bankroll", 100)
+                return data.get("state", {})
+        except:
+            pass
+    return None
+
+# =========================
 # STATE
 # =========================
-state = {}
+default_state = {}
 for m in markets:
-    state[m] = {
+    default_state[m] = {
         "up_streak": 0,
         "down_streak": 0,
         "in_trade": False,
@@ -33,6 +61,13 @@ for m in markets:
         "expected_profit": 0,
         "last_update": "Starting..."
     }
+
+loaded = load_state()
+
+if loaded:
+    state = loaded
+else:
+    state = default_state
 
 # =========================
 # TIME
@@ -76,7 +111,6 @@ def run_market(m):
 
     while True:
         try:
-            # WAIT FOR CANDLE CLOSE
             wait = wait_for_next_candle()
             time.sleep(wait + 2)
 
@@ -86,10 +120,9 @@ def run_market(m):
                 s["last_update"] = "No data"
                 continue
 
-            # HEARTBEAT
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
-            # STREAK LOGIC
+            # STREAK
             if last_close > prev_close:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
@@ -97,29 +130,24 @@ def run_market(m):
                 s["down_streak"] += 1
                 s["up_streak"] = 0
 
-            print(f"{m} → U:{s['up_streak']} D:{s['down_streak']}")
-
-            # ENTRY CONDITIONS
+            # ENTRY
             if not s["in_trade"]:
                 if s["up_streak"] >= 3:
                     s["in_trade"] = True
                     s["trade_direction"] = "DOWN"
                     s["step"] = 0
-                    s["entry_time"] = datetime.now(timezone.utc)
 
                 elif s["down_streak"] >= 3:
                     s["in_trade"] = True
                     s["trade_direction"] = "UP"
                     s["step"] = 0
-                    s["entry_time"] = datetime.now(timezone.utc)
 
-            # TRADING LOOP
+            # TRADE LOOP
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
 
                 s["current_bet"] = bet
                 s["expected_profit"] = bet * 0.75
-                s["entry_price"] = prev_close
 
                 wait = wait_for_next_candle()
                 time.sleep(wait + 2)
@@ -138,15 +166,9 @@ def run_market(m):
                         bankroll += profit
 
                     s["profit"] += profit
-
-                    # RESET
                     s["in_trade"] = False
                     s["up_streak"] = 0
                     s["down_streak"] = 0
-                    s["entry_price"] = None
-                    s["entry_time"] = None
-                    s["current_bet"] = 0
-                    s["expected_profit"] = 0
                     break
 
                 else:
@@ -156,25 +178,27 @@ def run_market(m):
                     s["profit"] -= bet
                     s["step"] += 1
 
-            # FAIL RESET
             if s["in_trade"] and s["step"] >= len(stake_levels):
                 s["in_trade"] = False
                 s["up_streak"] = 0
                 s["down_streak"] = 0
 
+            # 💾 SAVE EVERY LOOP
+            save_state()
+
         except Exception as e:
             print("THREAD ERROR:", e)
 
 # =========================
-# START BOTS (FIXED FOR RENDER)
+# START BOTS
 # =========================
 bots_started = False
 
 @app.before_request
-def ensure_bots_started():
+def start_once():
     global bots_started
     if not bots_started:
-        print("🔥 STARTING BOTS NOW...")
+        print("🔥 STARTING BOTS...")
         for m in markets:
             threading.Thread(target=run_market, args=(m,), daemon=True).start()
         bots_started = True
@@ -183,46 +207,20 @@ def ensure_bots_started():
 # UI
 # =========================
 HTML = """
-<!DOCTYPE html>
 <html>
-<head>
-<meta http-equiv="refresh" content="3">
-<style>
-body { font-family: Arial; background:#0f172a; color:white; padding:20px;}
-.card { background:#1e293b; padding:15px; margin:10px; border-radius:10px;}
-.green { color:#22c55e;} .red {color:#ef4444;} .yellow {color:#facc15;}
-</style>
-</head>
-<body>
+<head><meta http-equiv="refresh" content="3"></head>
+<body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>📊 Trading Dashboard</h1>
-
-<h2>💰 Bankroll: ${{bankroll}}</h2>
-<h3>⏱ Next Candle: {{countdown}}</h3>
+<h1>Dashboard</h1>
+<h2>Bank: ${{bankroll}}</h2>
+<h3>Next Candle: {{countdown}}</h3>
 
 {% for m,s in state.items() %}
-<div class="card">
-<h2>{{m}}</h2>
-
-<p>Streak: U{{s.up_streak}} / D{{s.down_streak}}</p>
+<div style="margin:10px;padding:10px;background:#1e293b">
+<h3>{{m}}</h3>
+<p>U:{{s.up_streak}} D:{{s.down_streak}}</p>
 <p>Last update: {{s.last_update}}</p>
-
-{% if s.in_trade %}
-<p class="yellow">Trading {{s.trade_direction}} Step {{s.step+1}}</p>
-<p>Bet: ${{s.current_bet}}</p>
-<p class="green">Profit: +${{s.expected_profit}}</p>
-{% else %}
-<p>Idle</p>
-{% endif %}
-
-<p>Market Profit:
-{% if s.profit>=0 %}
-<span class="green">{{s.profit}}</span>
-{% else %}
-<span class="red">{{s.profit}}</span>
-{% endif %}
-</p>
-
+<p>Profit: {{s.profit}}</p>
 </div>
 {% endfor %}
 
@@ -235,6 +233,6 @@ def dashboard():
     return render_template_string(
         HTML,
         state=state,
-        bankroll=round(bankroll,2),
+        bankroll=round(bankroll, 2),
         countdown=get_countdown()
     )
