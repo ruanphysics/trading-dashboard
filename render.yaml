@@ -1,12 +1,17 @@
 services:
   - type: web
-    name: polymarket-bot
+    name: polymarket-dashboard
     env: python
-    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+
+  - type: worker
+    name: polymarket-scraper
+    env: python
     buildCommand: |
       pip install -r requirements.txt
       PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium
-    startCommand: gunicorn app:app
+    startCommand: python scraper.py
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: 0

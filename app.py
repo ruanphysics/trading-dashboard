@@ -3,18 +3,12 @@ import threading
 from datetime import datetime
 import pytz
 import requests
-from flask import Flask, jsonify, render_template_string
-from playwright.sync_api import sync_playwright
+from flask import Flask, jsonify, request, render_template_string
 
 # =========================
 # SETTINGS
 # =========================
-markets = {
-    "bitcoin": "https://polymarket.com/event/btc-updown-5m",
-    "ethereum": "https://polymarket.com/event/eth-updown-5m",
-    "ripple": "https://polymarket.com/event/xrp-updown-5m",
-    "solana": "https://polymarket.com/event/sol-updown-5m"
-}
+markets = ["bitcoin","ethereum","ripple","solana"]
 
 symbols = {
     "bitcoin": "BTC-USD",
@@ -27,22 +21,11 @@ app = Flask(__name__)
 ET = pytz.timezone("America/New_York")
 START_TIME = time.time()
 
-# =========================
-# PLAYWRIGHT (CLOUD SAFE)
-# =========================
-playwright = sync_playwright().start()
-
-browser = playwright.chromium.launch(
-    headless=True,
-    args=[
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu"
-    ]
-)
-
-page = browser.new_page()
+# 🔥 shared memory (updated by worker)
+poly_data = {
+    m: {"yes": None, "no": None}
+    for m in markets
+}
 
 # =========================
 # TIME
@@ -58,7 +41,7 @@ def get_uptime():
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 # =========================
-# COINBASE PRICE
+# PRICE
 # =========================
 def get_price(symbol):
     try:
@@ -70,39 +53,28 @@ def get_price(symbol):
     except:
         return None
 
-# =========================
-# 🔥 SAFE SCRAPER
-# =========================
-def get_poly_prices(url):
-    try:
-        page.goto(url, timeout=15000)
-
-        # wait for JS to load
-        page.wait_for_timeout(2500)
-
-        content = page.content()
-
-        import re
-        matches = re.findall(r'([0]\.[0-9]{2})', content)
-
-        if len(matches) >= 2:
-            return float(matches[0]), float(matches[1])
-
-        return None, None
-
-    except Exception as e:
-        print("SCRAPE ERROR:", e)
-        return None, None
-
 def get_poly_signal(yes, no):
     if yes is None or no is None:
         return None
-
     if yes > 0.55:
         return "UP"
     elif no > 0.55:
         return "DOWN"
     return None
+
+# =========================
+# 🔥 API RECEIVER (NEW)
+# =========================
+@app.route("/update", methods=["POST"])
+def update():
+    data = request.json
+
+    for m in markets:
+        if m in data:
+            poly_data[m]["yes"] = data[m]["yes"]
+            poly_data[m]["no"] = data[m]["no"]
+
+    return {"status": "ok"}
 
 # =========================
 # STATE
@@ -128,10 +100,9 @@ def run_market(m):
     last_round = None
 
     while True:
-        time.sleep(6)
+        time.sleep(5)
 
         end, countdown = get_round_info()
-
         mins = countdown // 60
         secs = countdown % 60
         s["timer"] = f"{mins:02d}:{secs:02d}"
@@ -142,7 +113,10 @@ def run_market(m):
 
         s["price"] = price
 
-        yes, no = get_poly_prices(markets[m])
+        # 🔥 use worker data
+        yes = poly_data[m]["yes"]
+        no = poly_data[m]["no"]
+
         s["yes"] = yes
         s["no"] = no
         s["poly"] = get_poly_signal(yes, no)
@@ -222,7 +196,7 @@ async function load(){
   document.getElementById(m+"_bet").innerText=s.bet;
  }
 }
-setInterval(load,6000);
+setInterval(load,5000);
 </script>
 
 <body style="background:#111;color:white">
@@ -249,8 +223,5 @@ setInterval(load,6000);
 def home():
     return render_template_string(HTML, state=state)
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
