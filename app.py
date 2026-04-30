@@ -19,7 +19,7 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# 5-MIN TIMER
+# TIMER (5-MIN CYCLE)
 # =========================
 def get_countdown():
     now = datetime.utcnow()
@@ -31,34 +31,49 @@ def get_countdown():
     return f"{mins:02d}:{secs:02d}", remaining
 
 # =========================
+# AUTO MARKET ID
+# =========================
+def get_market_slug(asset):
+    now = int(time.time())
+    round_time = now - (now % 300)
+
+    prefix_map = {
+        "bitcoin": "btc",
+        "ethereum": "eth",
+        "ripple": "xrp",
+        "solana": "sol"
+    }
+
+    return f"{prefix_map[asset]}-updown-5m-{round_time}"
+
+# =========================
 # POLYMARKET PRICE
 # =========================
 def get_polymarket_price(asset):
     try:
-        url = "https://gamma-api.polymarket.com/markets"
-        res = requests.get(url, timeout=10).json()
+        slug = get_market_slug(asset)
+        url = f"https://gamma-api.polymarket.com/markets/{slug}"
 
-        asset_map = {
-            "bitcoin": ["bitcoin", "btc"],
-            "ethereum": ["ethereum", "eth"],
-            "ripple": ["ripple", "xrp"],
-            "solana": ["solana", "sol"]
-        }
+        res = requests.get(url, timeout=5)
 
-        keywords = asset_map[asset]
+        if res.status_code != 200:
+            return None
 
-        for m in res:
-            title = m.get("question", "").lower()
+        data = res.json()
+        outcomes = data.get("outcomes", [])
 
-            if any(k in title for k in keywords) and m.get("active", True):
-                outcomes = m.get("outcomes", [])
-                if outcomes:
-                    price = float(outcomes[0]["price"])
-                    if 0 < price < 1:
-                        return price
+        if not outcomes:
+            return None
+
+        price = float(outcomes[0]["price"])
+
+        if 0 < price < 1:
+            return price
 
         return None
-    except:
+
+    except Exception as e:
+        print("POLY ERROR:", e)
         return None
 
 # =========================
@@ -128,20 +143,21 @@ def run_market(m):
             price = get_polymarket_price(m)
 
             if price is None:
-                s["last_update"] = "No Polymarket data"
+                s["last_update"] = "Waiting for market..."
                 continue
 
             s["current_price"] = price
 
             current_cycle = int(time.time() // 300)
 
-            # NEW 5-MIN CYCLE DETECTED
             if last_cycle is None:
                 last_cycle = current_cycle
                 s["last_round_price"] = price
                 continue
 
+            # NEW ROUND DETECTED
             if current_cycle != last_cycle:
+
                 # DETERMINE OUTCOME
                 if price > s["last_round_price"]:
                     outcome = "UP"
@@ -155,7 +171,7 @@ def run_market(m):
                     if len(s["history"]) > 10:
                         s["history"].pop(0)
 
-                # APPLY STRATEGY
+                # STRATEGY
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
 
@@ -166,7 +182,7 @@ def run_market(m):
                     else:
                         s["signal"] = None
 
-                # PLACE SIMULATED TRADE
+                # ENTER TRADE
                 if s["signal"] and not s["in_trade"]:
                     s["in_trade"] = True
                     s["trade_direction"] = s["signal"]
@@ -181,7 +197,6 @@ def run_market(m):
                     s["entry_price"] = entry_price
                     s["expected_profit"] = round(bet * (1 - entry_price), 2)
 
-                    # RESOLVE IMMEDIATELY USING OUTCOME
                     win = False
                     if s["trade_direction"] == "UP" and outcome == "UP":
                         win = True
@@ -238,7 +253,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Outcome Bot</h1>
+<h1>Outcome Bot (Auto Markets)</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
@@ -269,7 +284,11 @@ HTML = """
 
 @app.route("/")
 def dashboard():
-    return render_template_string(HTML, state=state, bankroll=round(bankroll, 2))
+    return render_template_string(
+        HTML,
+        state=state,
+        bankroll=round(bankroll, 2)
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
