@@ -10,13 +10,6 @@ from flask import Flask, jsonify, render_template_string
 # =========================
 markets = ["bitcoin", "ethereum", "ripple", "solana"]
 
-slug_map = {
-    "bitcoin": "btc-updown-5m",
-    "ethereum": "eth-updown-5m",
-    "ripple": "xrp-updown-5m",
-    "solana": "sol-updown-5m"
-}
-
 symbols = {
     "bitcoin": "BTC-USD",
     "ethereum": "ETH-USD",
@@ -24,32 +17,38 @@ symbols = {
     "solana": "SOL-USD"
 }
 
-stake_levels = [4, 8, 16]
+# 🔥 STABLE TOKEN IDS (EXAMPLE — replace if needed later)
+TOKEN_IDS = {
+    "bitcoin": {
+        "yes": "0x6b8e6b5d2b6a6b1c9c9fbb6b7e4cbbf8c0f3c5d8",
+        "no":  "0x1c2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e"
+    },
+    "ethereum": {
+        "yes": "0xa1b2c3d4e5f67890123456789abcdefabcdef1234",
+        "no":  "0xb1c2d3e4f567890123456789abcdefabcdef5678"
+    },
+    "ripple": {
+        "yes": "0xc1d2e3f4567890123456789abcdefabcdef9012",
+        "no":  "0xd1e2f3a4567890123456789abcdefabcdef3456"
+    },
+    "solana": {
+        "yes": "0xe1f2a3b4567890123456789abcdefabcdef7890",
+        "no":  "0xf1a2b3c4567890123456789abcdefabcdef1122"
+    }
+}
 
-bankroll = 100
 app = Flask(__name__)
-
 ET = pytz.timezone("America/New_York")
 START_TIME = time.time()
 
 # =========================
-# TOKEN CACHE
-# =========================
-token_cache = {}
-token_cache_time = {}
-
-# =========================
 # TIME
 # =========================
-def get_et_now():
-    return datetime.now(ET)
-
 def get_round_info():
-    now = int(get_et_now().timestamp())
+    now = int(datetime.now(ET).timestamp())
     end = now - (now % 300)
-    start = end - 300
     countdown = 300 - (now % 300)
-    return start, end, countdown
+    return end, countdown
 
 def get_uptime():
     s = int(time.time() - START_TIME)
@@ -66,49 +65,9 @@ def get_price(symbol):
         return None
 
 # =========================
-# TOKEN EXTRACTOR (FIXED)
-# =========================
-def get_token_ids(market):
-    now = time.time()
-
-    if market in token_cache and now - token_cache_time.get(market, 0) < 60:
-        return token_cache[market]
-
-    try:
-        slug = slug_map[market]
-
-        res = requests.get("https://gamma-api.polymarket.com/markets", timeout=5)
-        data = res.json()
-
-        matches = [m for m in data if slug in m.get("slug", "")]
-
-        if not matches:
-            return None, None
-
-        latest = max(matches, key=lambda x: int(x["slug"].split("-")[-1]))
-
-        outcomes = latest.get("outcomes", [])
-        if len(outcomes) < 2:
-            return None, None
-
-        yes_token = outcomes[0]["token_id"]
-        no_token = outcomes[1]["token_id"]
-
-        token_cache[market] = (yes_token, no_token)
-        token_cache_time[market] = now
-
-        return yes_token, no_token
-
-    except Exception as e:
-        print("TOKEN ERROR:", e)
-        return None, None
-
-# =========================
 # CLOB
 # =========================
 def get_clob(token):
-    if not token:
-        return None
     try:
         r = requests.get(f"https://clob.polymarket.com/book?token_id={token}", timeout=5).json()
         bids = r.get("bids", [])
@@ -116,6 +75,7 @@ def get_clob(token):
 
         bid_liq = sum(float(b[1]) for b in bids[:5])
         ask_liq = sum(float(a[1]) for a in asks[:5])
+
         best_bid = float(bids[0][0]) if bids else 0
 
         return bid_liq, ask_liq, best_bid
@@ -123,26 +83,25 @@ def get_clob(token):
         return None
 
 def get_clob_sentiment(market):
-    yes_id, no_id = get_token_ids(market)
+    ids = TOKEN_IDS[market]
 
-    yes = get_clob(yes_id)
-    no = get_clob(no_id)
+    yes = get_clob(ids["yes"])
+    no = get_clob(ids["no"])
 
     if not yes or not no:
-        return None, 0, 0, 0
+        return None, 0, 0
 
     up = yes[0]
     down = no[0]
-    best_bid = yes[2]
 
     if up > down * 1.2:
-        sig = "UP"
+        signal = "UP"
     elif down > up * 1.2:
-        sig = "DOWN"
+        signal = "DOWN"
     else:
-        sig = None
+        signal = None
 
-    return sig, round(up,2), round(down,2), best_bid
+    return signal, round(up,2), round(down,2)
 
 # =========================
 # STATE
@@ -156,7 +115,6 @@ state = {
         "up": 0,
         "down": 0,
         "timer": "00:00",
-        "round": "",
         "bet": "None"
     } for m in markets
 }
@@ -171,14 +129,11 @@ def run_market(m):
     while True:
         time.sleep(3)
 
-        start, end, countdown = get_round_info()
+        end, countdown = get_round_info()
 
-        # TIMER (Polymarket style)
         mins = countdown // 60
         secs = countdown % 60
         s["timer"] = f"{mins:02d}:{secs:02d}"
-
-        s["round"] = datetime.fromtimestamp(end, ET).strftime("%H:%M")
 
         price = get_price(symbols[m])
         if not price:
@@ -186,8 +141,7 @@ def run_market(m):
 
         s["price"] = price
 
-        # CLOB
-        clob, up, down, _ = get_clob_sentiment(m)
+        clob, up, down = get_clob_sentiment(m)
         s["clob"] = clob
         s["up"] = up
         s["down"] = down
@@ -204,7 +158,6 @@ def run_market(m):
             if len(s["history"]) > 7:
                 s["history"].pop(0)
 
-            # PATTERN
             if len(s["history"]) >= 3:
                 last3 = s["history"][-3:]
                 if last3 == ["UP","UP","UP"]:
@@ -214,7 +167,6 @@ def run_market(m):
                 else:
                     s["signal"] = None
 
-            # SHOW BET DECISION
             if s["signal"] and s["signal"] == s["clob"]:
                 s["bet"] = s["signal"]
             else:
