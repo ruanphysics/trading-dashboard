@@ -47,10 +47,7 @@ def get_countdown_seconds():
 
 def get_uptime():
     seconds = int(time.time() - START_TIME)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 # =========================
 # PRICE
@@ -95,6 +92,8 @@ for m in markets:
         "start_price": None,
         "current_price": None,
         "signal": None,
+        "last_signal": None,
+        "waiting_for_pattern": False,
         "in_trade": False,
         "trade_direction": None,
         "step": 0,
@@ -104,8 +103,7 @@ for m in markets:
         "just_entered": False,
         "last_processed_end": None,
         "round": "",
-        "countdown": 0,
-        "last_update": "Starting..."
+        "countdown": 0
     }
 
 loaded = load_state()
@@ -117,19 +115,14 @@ state = loaded if loaded else default_state
 def run_market(m):
     global bankroll
     s = state[m]
-
     last_round_end = None
 
     while True:
         try:
-            time.sleep(1)  # ✅ precise loop
+            time.sleep(1)
 
             start, end = get_round_times()
-
-            next_start = end
-            next_end = end + 300
-
-            s["round"] = f"{datetime.fromtimestamp(next_start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(next_end, ET).strftime('%H:%M')}"
+            s["round"] = f"{datetime.fromtimestamp(start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(end, ET).strftime('%H:%M')}"
             s["countdown"] = get_countdown_seconds()
 
             price = get_coinbase_price(symbols[m])
@@ -143,47 +136,65 @@ def run_market(m):
                 s["start_price"] = price
                 continue
 
-            # ✅ ROUND GUARD (fixes XRP issue)
+            # ROUND GUARD
             if s["last_processed_end"] == end:
                 continue
 
             if end > last_round_end:
                 s["last_processed_end"] = end
-                end_price = price
-
-                s["pending"] = False  # clear pending immediately
+                s["pending"] = False
 
                 # OUTCOME
-                if end_price > s["start_price"]:
+                if price > s["start_price"]:
                     outcome = "UP"
-                elif end_price < s["start_price"]:
+                elif price < s["start_price"]:
                     outcome = "DOWN"
                 else:
                     outcome = "FLAT"
 
-                # HISTORY
                 if outcome != "FLAT":
                     s["history"].append(outcome)
                     if len(s["history"]) > 7:
                         s["history"].pop(0)
 
-                # SIGNAL
+                # SIGNAL DETECTION
+                new_signal = None
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
                     if last3 == ["UP","UP","UP"]:
-                        s["signal"] = "DOWN"
+                        new_signal = "DOWN"
                     elif last3 == ["DOWN","DOWN","DOWN"]:
-                        s["signal"] = "UP"
-                    else:
-                        s["signal"] = None
+                        new_signal = "UP"
 
-                # ENTER TRADE
-                if s["signal"] and not s["in_trade"]:
-                    s["in_trade"] = True
-                    s["trade_direction"] = s["signal"]
-                    s["step"] = 0
-                    s["just_entered"] = True
-                    s["pending"] = True
+                # NEW PATTERN DETECTION
+                if new_signal != s["last_signal"]:
+                    s["signal"] = new_signal
+                    s["last_signal"] = new_signal
+
+                    if s["waiting_for_pattern"]:
+                        s["waiting_for_pattern"] = False
+                else:
+                    s["signal"] = None
+
+                # ENTER / CONTINUE TRADE
+                if s["signal"] and not s["waiting_for_pattern"]:
+
+                    if not s["in_trade"]:
+                        s["in_trade"] = True
+                        s["trade_direction"] = s["signal"]
+                        s["step"] = 0
+                        s["bet"] = stake_levels[0]
+                        s["just_entered"] = True
+                        s["pending"] = True
+
+                    elif s["signal"] != s["trade_direction"]:
+                        # new direction → reset
+                        s["in_trade"] = True
+                        s["trade_direction"] = s["signal"]
+                        s["step"] = 0
+                        s["bet"] = stake_levels[0]
+                        s["just_entered"] = True
+                        s["pending"] = True
 
                 # EXECUTE TRADE
                 if s["in_trade"]:
@@ -204,7 +215,9 @@ def run_market(m):
                                 bankroll += profit
                             s["profit"] += profit
 
+                            # RESET + WAIT
                             s["in_trade"] = False
+                            s["waiting_for_pattern"] = True
                             s["signal"] = None
                             s["trade_direction"] = None
                             s["step"] = 0
@@ -218,7 +231,9 @@ def run_market(m):
                             s["step"] += 1
 
                             if s["step"] >= len(stake_levels):
+                                # LOST STEP 3 → RESET + WAIT
                                 s["in_trade"] = False
+                                s["waiting_for_pattern"] = True
                                 s["signal"] = None
                                 s["trade_direction"] = None
                                 s["step"] = 0
@@ -229,8 +244,6 @@ def run_market(m):
                 s["start_price"] = price
                 last_round_end = end
                 save_state()
-
-            s["last_update"] = datetime.now(ET).strftime("%H:%M:%S")
 
         except Exception as e:
             print("ERROR:", e)
@@ -267,11 +280,10 @@ HTML = """
 <head>
 <script>
 function formatHistory(arr){
-    return arr.map(x => {
-        if(x === "UP") return '<span style="color:#22c55e">UP</span>';
-        if(x === "DOWN") return '<span style="color:#ef4444">DOWN</span>';
-        return x;
-    }).join(", ");
+    return arr.map(x => x === "UP"
+        ? '<span style="color:#22c55e">UP</span>'
+        : '<span style="color:#ef4444">DOWN</span>'
+    ).join(", ");
 }
 
 async function fetchData() {
@@ -282,27 +294,30 @@ async function fetchData() {
     document.getElementById("uptime").innerText = data.uptime;
 
     for (const [m, s] of Object.entries(data.state)) {
-        document.getElementById(m+"_price").innerText = s.current_price ?? "-";
-        document.getElementById(m+"_signal").innerText = s.signal ?? "-";
-        document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
-        document.getElementById(m+"_round").innerText = s.round;
 
-        if(s.pending){
-            document.getElementById(m+"_profit").innerText = "Pending";
-        } else {
-            document.getElementById(m+"_profit").innerText = "$" + s.profit.toFixed(2);
-        }
+        document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
+        document.getElementById(m+"_signal").innerText = s.signal ?? "-";
+        document.getElementById(m+"_round").innerText = s.round;
 
         let sec = s.countdown;
         let min = String(Math.floor(sec/60)).padStart(2,'0');
         let s2 = String(sec%60).padStart(2,'0');
         document.getElementById(m+"_timer").innerText = min + ":" + s2;
 
-        if(s.in_trade){
+        if(s.waiting_for_pattern){
+            document.getElementById(m+"_trade").innerText = "Waiting for pattern";
+        }
+        else if(s.in_trade){
             document.getElementById(m+"_trade").innerText =
                 s.trade_direction + " | $" + s.bet + " | Step " + (s.step+1);
         } else {
             document.getElementById(m+"_trade").innerText = "None";
+        }
+
+        if(s.pending){
+            document.getElementById(m+"_profit").innerText = "Pending";
+        } else {
+            document.getElementById(m+"_profit").innerText = "$" + s.profit.toFixed(2);
         }
     }
 }
@@ -313,7 +328,7 @@ setInterval(fetchData, 2000);
 
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Stable)</h1>
+<h1>Hybrid Bot (Final Logic)</h1>
 <h2>Bank: $<span id="bank">...</span></h2>
 
 <div style="position:fixed;top:10px;right:20px;color:#94a3b8">
@@ -326,13 +341,11 @@ Uptime: <span id="uptime">00:00:00</span>
 
 <p>Round: <span id="{{m}}_round">-</span></p>
 <p>⏳ <span id="{{m}}_timer">--:--</span></p>
-<p>Price: <span id="{{m}}_price">-</span></p>
 
 <p>Signal: <span id="{{m}}_signal">-</span></p>
 <p>History: <span id="{{m}}_history">-</span></p>
 
 <p>Active Bet: <span id="{{m}}_trade">None</span></p>
-
 <p>Profit: <span id="{{m}}_profit">0</span></p>
 
 </div>
