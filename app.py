@@ -1,6 +1,7 @@
 import requests
 import time
 import threading
+import re
 from datetime import datetime
 import pytz
 from flask import Flask, jsonify, render_template_string
@@ -8,13 +9,11 @@ from flask import Flask, jsonify, render_template_string
 # =========================
 # SETTINGS
 # =========================
-markets = ["bitcoin", "ethereum", "ripple", "solana"]
-
-slug_map = {
-    "bitcoin": "btc-updown-5m",
-    "ethereum": "eth-updown-5m",
-    "ripple": "xrp-updown-5m",
-    "solana": "sol-updown-5m"
+markets = {
+    "bitcoin": "https://polymarket.com/event/btc-updown-5m",
+    "ethereum": "https://polymarket.com/event/eth-updown-5m",
+    "ripple": "https://polymarket.com/event/xrp-updown-5m",
+    "solana": "https://polymarket.com/event/sol-updown-5m"
 }
 
 symbols = {
@@ -42,7 +41,7 @@ def get_uptime():
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 # =========================
-# COINBASE PRICE
+# PRICE
 # =========================
 def get_price(symbol):
     try:
@@ -55,37 +54,25 @@ def get_price(symbol):
         return None
 
 # =========================
-# 🔥 REAL POLYMARKET PRICES
+# 🔥 EXTRACT POLYMARKET PAGE DATA
 # =========================
-def get_polymarket_prices(market):
+def get_poly_prices(url):
     try:
-        slug = slug_map[market]
+        html = requests.get(url, timeout=5).text
 
-        res = requests.get("https://gamma-api.polymarket.com/markets", timeout=5)
-        data = res.json()
+        # find probability values (they appear as decimals like 0.62)
+        matches = re.findall(r'"price":\s*([0-9.]+)', html)
 
-        matches = [m for m in data if slug in m.get("slug", "")]
+        if len(matches) >= 2:
+            yes = float(matches[0])
+            no = float(matches[1])
+            return yes, no
 
-        if not matches:
-            return None, None
-
-        latest = max(matches, key=lambda x: int(x["slug"].split("-")[-1]))
-
-        outcomes = latest.get("outcomes", [])
-        if len(outcomes) < 2:
-            return None, None
-
-        yes_price = float(outcomes[0].get("price", 0))
-        no_price = float(outcomes[1].get("price", 0))
-
-        return yes_price, no_price
+        return None, None
 
     except:
         return None, None
 
-# =========================
-# SENTIMENT FROM REAL PRICES
-# =========================
 def get_poly_signal(yes, no):
     if yes is None or no is None:
         return None
@@ -121,7 +108,7 @@ def run_market(m):
     last_round = None
 
     while True:
-        time.sleep(3)
+        time.sleep(4)
 
         end, countdown = get_round_info()
 
@@ -129,14 +116,14 @@ def run_market(m):
         secs = countdown % 60
         s["timer"] = f"{mins:02d}:{secs:02d}"
 
-        # Coinbase price
         price = get_price(symbols[m])
         if not price:
             continue
+
         s["price"] = price
 
-        # 🔥 Polymarket prices
-        yes, no = get_polymarket_prices(m)
+        # 🔥 real polymarket extraction
+        yes, no = get_poly_prices(markets[m])
         s["yes"] = yes
         s["no"] = no
         s["poly"] = get_poly_signal(yes, no)
@@ -153,7 +140,7 @@ def run_market(m):
             if len(s["history"]) > 7:
                 s["history"].pop(0)
 
-            # Pattern
+            # pattern logic
             if len(s["history"]) >= 3:
                 last3 = s["history"][-3:]
                 if last3 == ["UP","UP","UP"]:
@@ -163,7 +150,7 @@ def run_market(m):
                 else:
                     s["pattern"] = None
 
-            # Final decision
+            # bet decision
             if s["pattern"] and s["pattern"] == s["poly"]:
                 s["bet"] = s["pattern"]
             else:
@@ -218,7 +205,7 @@ async function load(){
   document.getElementById(m+"_bet").innerText=s.bet;
  }
 }
-setInterval(load,3000);
+setInterval(load,4000);
 </script>
 
 <body style="background:#111;color:white">
@@ -229,8 +216,8 @@ setInterval(load,3000);
 <h3>{{m}}</h3>
 <p>Timer: <span id="{{m}}_timer"></span></p>
 <p>Price: <span id="{{m}}_p"></span></p>
-<p>YES (UP): <span id="{{m}}_yes"></span></p>
-<p>NO (DOWN): <span id="{{m}}_no"></span></p>
+<p>YES: <span id="{{m}}_yes"></span></p>
+<p>NO: <span id="{{m}}_no"></span></p>
 <p>Pattern: <span id="{{m}}_pattern"></span></p>
 <p>Polymarket: <span id="{{m}}_poly"></span></p>
 <p>Bet: <span id="{{m}}_bet"></span></p>
@@ -245,8 +232,5 @@ setInterval(load,3000);
 def home():
     return render_template_string(HTML, state=state)
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
