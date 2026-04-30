@@ -92,8 +92,6 @@ for m in markets:
         "start_price": None,
         "current_price": None,
         "signal": None,
-        "last_signal": None,
-        "waiting_for_pattern": False,
         "in_trade": False,
         "trade_direction": None,
         "step": 0,
@@ -101,6 +99,7 @@ for m in markets:
         "bet": 0,
         "pending": False,
         "just_entered": False,
+        "waiting_for_pattern": False,
         "last_processed_end": None,
         "round": "",
         "countdown": 0
@@ -108,6 +107,21 @@ for m in markets:
 
 loaded = load_state()
 state = loaded if loaded else default_state
+
+# =========================
+# STREAK FUNCTION
+# =========================
+def get_streak(history):
+    if not history:
+        return None, 0
+    last = history[-1]
+    count = 1
+    for i in range(len(history)-2, -1, -1):
+        if history[i] == last:
+            count += 1
+        else:
+            break
+    return last, count
 
 # =========================
 # BOT
@@ -122,6 +136,7 @@ def run_market(m):
             time.sleep(1)
 
             start, end = get_round_times()
+
             s["round"] = f"{datetime.fromtimestamp(start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(end, ET).strftime('%H:%M')}"
             s["countdown"] = get_countdown_seconds()
 
@@ -136,7 +151,7 @@ def run_market(m):
                 s["start_price"] = price
                 continue
 
-            # ROUND GUARD
+            # round guard
             if s["last_processed_end"] == end:
                 continue
 
@@ -144,7 +159,7 @@ def run_market(m):
                 s["last_processed_end"] = end
                 s["pending"] = False
 
-                # OUTCOME
+                # outcome
                 if price > s["start_price"]:
                     outcome = "UP"
                 elif price < s["start_price"]:
@@ -157,46 +172,36 @@ def run_market(m):
                     if len(s["history"]) > 7:
                         s["history"].pop(0)
 
-                # SIGNAL DETECTION
-                new_signal = None
-                if len(s["history"]) >= 3:
-                    last3 = s["history"][-3:]
-                    if last3 == ["UP","UP","UP"]:
-                        new_signal = "DOWN"
-                    elif last3 == ["DOWN","DOWN","DOWN"]:
-                        new_signal = "UP"
+                # streak logic
+                streak_dir, streak_count = get_streak(s["history"])
 
-                # NEW PATTERN DETECTION
-                if new_signal != s["last_signal"]:
-                    s["signal"] = new_signal
-                    s["last_signal"] = new_signal
-
-                    if s["waiting_for_pattern"]:
-                        s["waiting_for_pattern"] = False
+                # signal
+                if streak_count >= 3:
+                    s["signal"] = "DOWN" if streak_dir == "UP" else "UP"
                 else:
                     s["signal"] = None
 
-                # ENTER / CONTINUE TRADE
-                if s["signal"] and not s["waiting_for_pattern"]:
-
-                    if not s["in_trade"]:
-                        s["in_trade"] = True
-                        s["trade_direction"] = s["signal"]
+                # 🔥 STOP TRADE if streak breaks
+                if s["in_trade"]:
+                    if (
+                        (s["trade_direction"] == "UP" and streak_dir != "DOWN") or
+                        (s["trade_direction"] == "DOWN" and streak_dir != "UP")
+                    ):
+                        s["in_trade"] = False
+                        s["waiting_for_pattern"] = True
+                        s["trade_direction"] = None
                         s["step"] = 0
-                        s["bet"] = stake_levels[0]
-                        s["just_entered"] = True
-                        s["pending"] = True
 
-                    elif s["signal"] != s["trade_direction"]:
-                        # new direction → reset
-                        s["in_trade"] = True
-                        s["trade_direction"] = s["signal"]
-                        s["step"] = 0
-                        s["bet"] = stake_levels[0]
-                        s["just_entered"] = True
-                        s["pending"] = True
+                # ENTER TRADE
+                if s["signal"] and not s["in_trade"] and not s["waiting_for_pattern"]:
+                    s["in_trade"] = True
+                    s["trade_direction"] = s["signal"]
+                    s["step"] = 0
+                    s["bet"] = stake_levels[0]
+                    s["just_entered"] = True
+                    s["pending"] = True
 
-                # EXECUTE TRADE
+                # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
                     s["bet"] = bet
@@ -215,10 +220,8 @@ def run_market(m):
                                 bankroll += profit
                             s["profit"] += profit
 
-                            # RESET + WAIT
                             s["in_trade"] = False
                             s["waiting_for_pattern"] = True
-                            s["signal"] = None
                             s["trade_direction"] = None
                             s["step"] = 0
 
@@ -231,10 +234,8 @@ def run_market(m):
                             s["step"] += 1
 
                             if s["step"] >= len(stake_levels):
-                                # LOST STEP 3 → RESET + WAIT
                                 s["in_trade"] = False
                                 s["waiting_for_pattern"] = True
-                                s["signal"] = None
                                 s["trade_direction"] = None
                                 s["step"] = 0
                             else:
@@ -249,7 +250,7 @@ def run_market(m):
             print("ERROR:", e)
 
 # =========================
-# START THREADS
+# START
 # =========================
 started = False
 
@@ -315,9 +316,11 @@ async function fetchData() {
         }
 
         if(s.pending){
-            document.getElementById(m+"_profit").innerText = "Pending";
+            document.getElementById(m+"_profit").innerText =
+                "Pending (internal: $" + s.profit.toFixed(2) + ")";
         } else {
-            document.getElementById(m+"_profit").innerText = "$" + s.profit.toFixed(2);
+            document.getElementById(m+"_profit").innerText =
+                "$" + s.profit.toFixed(2);
         }
     }
 }
@@ -328,7 +331,7 @@ setInterval(fetchData, 2000);
 
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Final Logic)</h1>
+<h1>Hybrid Bot (Streak Logic)</h1>
 <h2>Bank: $<span id="bank">...</span></h2>
 
 <div style="position:fixed;top:10px;right:20px;color:#94a3b8">
