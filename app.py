@@ -3,8 +3,9 @@ import time
 import threading
 import json
 import os
-from datetime import datetime, timezone
-from flask import Flask, render_template_string
+from datetime import datetime
+import pytz
+from flask import Flask, jsonify, render_template_string
 
 # =========================
 # SETTINGS
@@ -25,19 +26,23 @@ bankroll_lock = threading.Lock()
 
 app = Flask(__name__)
 
+ET = pytz.timezone("America/New_York")
+
 # =========================
-# TIMER (ALIGNED)
+# TIME (ET ALIGNED)
 # =========================
+def get_et_timestamp():
+    return int(datetime.now(ET).timestamp())
+
 def get_round_times():
-    now = int(time.time())
+    now = get_et_timestamp()
     end = now - (now % 300)
     start = end - 300
     return start, end
 
-def get_countdown():
-    now = int(time.time())
-    remaining = 300 - (now % 300)
-    return f"{remaining//60:02d}:{remaining%60:02d}", remaining
+def get_countdown_seconds():
+    now = get_et_timestamp()
+    return 300 - (now % 300)
 
 # =========================
 # COINBASE PRICE
@@ -51,14 +56,14 @@ def get_coinbase_price(symbol):
         return None
 
 # =========================
-# POLYMARKET PRICE (OPTIONAL)
+# SIMPLE POLY PRICE (fallback = 0.5)
 # =========================
 def get_poly_price():
     try:
         url = "https://gamma-api.polymarket.com/events"
         res = requests.get(url, timeout=5)
         if res.status_code != 200:
-            return None
+            return 0.5
 
         data = res.json()
         for e in data:
@@ -69,9 +74,9 @@ def get_poly_price():
                     p = float(outcomes[0]["price"])
                     if 0 < p < 1:
                         return p
-        return None
+        return 0.5
     except:
-        return None
+        return 0.5
 
 # =========================
 # SAVE / LOAD
@@ -103,7 +108,6 @@ for m in markets:
     default_state[m] = {
         "history": [],
         "start_price": None,
-        "end_price": None,
         "current_price": None,
         "signal": None,
         "in_trade": False,
@@ -113,9 +117,8 @@ for m in markets:
         "bet": 0,
         "entry_price": None,
         "expected_profit": 0,
-        "countdown": "--:--",
-        "last_update": "Starting...",
         "round": "",
+        "last_update": "Starting..."
     }
 
 loaded = load_state()
@@ -132,36 +135,30 @@ def run_market(m):
 
     while True:
         try:
-            time.sleep(5)
-
-            countdown, _ = get_countdown()
-            s["countdown"] = countdown
+            time.sleep(3)
 
             start, end = get_round_times()
-            s["round"] = f"{datetime.utcfromtimestamp(start).strftime('%H:%M')} → {datetime.utcfromtimestamp(end).strftime('%H:%M')}"
+            s["round"] = f"{datetime.fromtimestamp(start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(end, ET).strftime('%H:%M')}"
 
             price = get_coinbase_price(symbols[m])
 
             if price is None:
-                s["last_update"] = "No Coinbase data"
+                s["last_update"] = "No price"
                 continue
 
             s["current_price"] = price
 
-            # FIRST INIT
             if last_round_end is None:
                 last_round_end = end
                 s["start_price"] = price
                 continue
 
-            # NEW ROUND DETECTED
             if end != last_round_end:
-                s["end_price"] = price
+                end_price = price
 
-                # DETERMINE OUTCOME
-                if s["end_price"] > s["start_price"]:
+                if end_price > s["start_price"]:
                     outcome = "UP"
-                elif s["end_price"] < s["start_price"]:
+                elif end_price < s["start_price"]:
                     outcome = "DOWN"
                 else:
                     outcome = "FLAT"
@@ -187,10 +184,10 @@ def run_market(m):
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
 
-                # EXECUTE TRADE
+                # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
-                    entry_price = get_poly_price() or 0.5
+                    entry_price = get_poly_price()
 
                     s["bet"] = bet
                     s["entry_price"] = entry_price
@@ -217,19 +214,17 @@ def run_market(m):
                         if s["step"] >= len(stake_levels):
                             s["in_trade"] = False
 
-                # RESET FOR NEXT ROUND
                 s["start_price"] = price
                 last_round_end = end
-
                 save_state()
 
-            s["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
+            s["last_update"] = datetime.now(ET).strftime("%H:%M:%S")
 
         except Exception as e:
             print("ERROR:", e)
 
 # =========================
-# START
+# START THREADS
 # =========================
 started = False
 
@@ -242,39 +237,78 @@ def start_once():
         started = True
 
 # =========================
-# UI
+# API ENDPOINT
+# =========================
+@app.route("/data")
+def data():
+    return jsonify({
+        "state": state,
+        "bankroll": round(bankroll, 2),
+        "countdown": get_countdown_seconds()
+    })
+
+# =========================
+# UI (SMOOTH)
 # =========================
 HTML = """
 <html>
-<head><meta http-equiv="refresh" content="5"></head>
+<head>
+<script>
+async function fetchData() {
+    const res = await fetch('/data');
+    const data = await res.json();
+
+    document.getElementById("bank").innerText = data.bankroll;
+
+    for (const [m, s] of Object.entries(data.state)) {
+        document.getElementById(m+"_price").innerText = s.current_price ?? "-";
+        document.getElementById(m+"_signal").innerText = s.signal ?? "-";
+        document.getElementById(m+"_history").innerText = s.history.join(",");
+        document.getElementById(m+"_round").innerText = s.round;
+        document.getElementById(m+"_update").innerText = s.last_update;
+    }
+}
+
+function countdownTick() {
+    let el = document.getElementById("timer");
+    let val = parseInt(el.dataset.seconds);
+    val = (val - 1 + 300) % 300;
+    el.dataset.seconds = val;
+    let m = String(Math.floor(val/60)).padStart(2,'0');
+    let s = String(val%60).padStart(2,'0');
+    el.innerText = m + ":" + s;
+}
+
+async function init() {
+    const res = await fetch('/data');
+    const data = await res.json();
+    document.getElementById("timer").dataset.seconds = data.countdown;
+
+    setInterval(fetchData, 3000);
+    setInterval(countdownTick, 1000);
+}
+
+window.onload = init;
+</script>
+</head>
+
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Stable)</h1>
-<h2>Bank: ${{bankroll}}</h2>
+<h1>Hybrid Bot (Smooth)</h1>
+<h2>Bank: $<span id="bank">...</span></h2>
 
-{% for m,s in state.items() %}
+<h2>⏳ <span id="timer" data-seconds="0">--:--</span></h2>
+
+{% for m in state %}
 <div style="margin:10px;padding:10px;background:#1e293b">
 <h3>{{m}}</h3>
 
-<p>Round: {{s.round}}</p>
-<p>⏳ {{s.countdown}}</p>
-<p>Start: {{s.start_price}}</p>
-<p>Current: {{s.current_price}}</p>
+<p>Round: <span id="{{m}}_round">-</span></p>
+<p>Price: <span id="{{m}}_price">-</span></p>
+<p>Signal: <span id="{{m}}_signal">-</span></p>
+<p>History: <span id="{{m}}_history">-</span></p>
+<p>Last update: <span id="{{m}}_update">-</span></p>
 
-<p>History: {{s.history}}</p>
-<p>Signal: {{s.signal}}</p>
-<p>Last update: {{s.last_update}}</p>
-
-{% if s.in_trade %}
-<p>Trading {{s.trade_direction}} (step {{s.step+1}})</p>
-<p>Bet: ${{s.bet}}</p>
-<p>Entry price: {{s.entry_price}}</p>
-<p>Expected profit: ${{s.expected_profit}}</p>
-{% else %}
-<p>Idle</p>
-{% endif %}
-
-<p>Profit: {{s.profit}}</p>
 </div>
 {% endfor %}
 
@@ -284,7 +318,7 @@ HTML = """
 
 @app.route("/")
 def dashboard():
-    return render_template_string(HTML, state=state, bankroll=round(bankroll,2))
+    return render_template_string(HTML, state=state)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
