@@ -28,50 +28,43 @@ def get_countdown():
     return f"{remaining//60:02d}:{remaining%60:02d}", remaining
 
 # =========================
-# MARKET SLUG (ROBUST)
-# =========================
-def get_possible_slugs(asset):
-    now = int(time.time())
-
-    base = now - (now % 300)
-
-    prefix_map = {
-        "bitcoin": "btc",
-        "ethereum": "eth",
-        "ripple": "xrp",
-        "solana": "sol"
-    }
-
-    prefix = prefix_map[asset]
-
-    # Try previous, current, next round
-    return [
-        f"{prefix}-updown-5m-{base - 300}",
-        f"{prefix}-updown-5m-{base}",
-        f"{prefix}-updown-5m-{base + 300}"
-    ]
-
-# =========================
-# POLYMARKET FETCH
+# POLYMARKET (FIXED)
 # =========================
 def get_polymarket_price(asset):
     try:
-        slugs = get_possible_slugs(asset)
+        url = "https://gamma-api.polymarket.com/events"
+        res = requests.get(url, timeout=5)
 
-        for slug in slugs:
-            url = f"https://gamma-api.polymarket.com/markets/{slug}"
-            res = requests.get(url, timeout=5)
+        if res.status_code != 200:
+            return None
 
-            if res.status_code != 200:
-                continue
+        data = res.json()
 
-            data = res.json()
-            outcomes = data.get("outcomes", [])
+        prefix_map = {
+            "bitcoin": "btc-updown-5m",
+            "ethereum": "eth-updown-5m",
+            "ripple": "xrp-updown-5m",
+            "solana": "sol-updown-5m"
+        }
 
-            if outcomes:
-                price = float(outcomes[0]["price"])
-                if 0 < price < 1:
-                    return price
+        keyword = prefix_map[asset]
+
+        for event in data:
+            slug = event.get("slug", "")
+
+            if keyword in slug:
+                markets = event.get("markets", [])
+
+                if markets:
+                    outcomes = markets[0].get("outcomes", [])
+
+                    if outcomes:
+                        try:
+                            price = float(outcomes[0]["price"])
+                            if 0 < price < 1:
+                                return price
+                        except:
+                            continue
 
         return None
 
@@ -247,7 +240,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Outcome Bot (Stable)</h1>
+<h1>Outcome Bot (Final)</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
