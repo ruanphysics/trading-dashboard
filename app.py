@@ -10,31 +10,18 @@ from flask import Flask, jsonify, render_template_string
 # =========================
 markets = ["bitcoin", "ethereum", "ripple", "solana"]
 
+slug_map = {
+    "bitcoin": "btc-updown-5m",
+    "ethereum": "eth-updown-5m",
+    "ripple": "xrp-updown-5m",
+    "solana": "sol-updown-5m"
+}
+
 symbols = {
     "bitcoin": "BTC-USD",
     "ethereum": "ETH-USD",
     "ripple": "XRP-USD",
     "solana": "SOL-USD"
-}
-
-# 🔥 STABLE TOKEN IDS (EXAMPLE — replace if needed later)
-TOKEN_IDS = {
-    "bitcoin": {
-        "yes": "0x6b8e6b5d2b6a6b1c9c9fbb6b7e4cbbf8c0f3c5d8",
-        "no":  "0x1c2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e"
-    },
-    "ethereum": {
-        "yes": "0xa1b2c3d4e5f67890123456789abcdefabcdef1234",
-        "no":  "0xb1c2d3e4f567890123456789abcdefabcdef5678"
-    },
-    "ripple": {
-        "yes": "0xc1d2e3f4567890123456789abcdefabcdef9012",
-        "no":  "0xd1e2f3a4567890123456789abcdefabcdef3456"
-    },
-    "solana": {
-        "yes": "0xe1f2a3b4567890123456789abcdefabcdef7890",
-        "no":  "0xf1a2b3c4567890123456789abcdefabcdef1122"
-    }
 }
 
 app = Flask(__name__)
@@ -55,53 +42,60 @@ def get_uptime():
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 # =========================
-# PRICE
+# COINBASE PRICE
 # =========================
 def get_price(symbol):
     try:
-        r = requests.get(f"https://api.exchange.coinbase.com/products/{symbol}/ticker", timeout=5).json()
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{symbol}/ticker",
+            timeout=5
+        ).json()
         return float(r["price"])
     except:
         return None
 
 # =========================
-# CLOB
+# 🔥 REAL POLYMARKET PRICES
 # =========================
-def get_clob(token):
+def get_polymarket_prices(market):
     try:
-        r = requests.get(f"https://clob.polymarket.com/book?token_id={token}", timeout=5).json()
-        bids = r.get("bids", [])
-        asks = r.get("asks", [])
+        slug = slug_map[market]
 
-        bid_liq = sum(float(b[1]) for b in bids[:5])
-        ask_liq = sum(float(a[1]) for a in asks[:5])
+        res = requests.get("https://gamma-api.polymarket.com/markets", timeout=5)
+        data = res.json()
 
-        best_bid = float(bids[0][0]) if bids else 0
+        matches = [m for m in data if slug in m.get("slug", "")]
 
-        return bid_liq, ask_liq, best_bid
+        if not matches:
+            return None, None
+
+        latest = max(matches, key=lambda x: int(x["slug"].split("-")[-1]))
+
+        outcomes = latest.get("outcomes", [])
+        if len(outcomes) < 2:
+            return None, None
+
+        yes_price = float(outcomes[0].get("price", 0))
+        no_price = float(outcomes[1].get("price", 0))
+
+        return yes_price, no_price
+
     except:
+        return None, None
+
+# =========================
+# SENTIMENT FROM REAL PRICES
+# =========================
+def get_poly_signal(yes, no):
+    if yes is None or no is None:
         return None
 
-def get_clob_sentiment(market):
-    ids = TOKEN_IDS[market]
-
-    yes = get_clob(ids["yes"])
-    no = get_clob(ids["no"])
-
-    if not yes or not no:
-        return None, 0, 0
-
-    up = yes[0]
-    down = no[0]
-
-    if up > down * 1.2:
-        signal = "UP"
-    elif down > up * 1.2:
-        signal = "DOWN"
+    if yes > 0.55:
+        return "UP"
+    elif no > 0.55:
+        return "DOWN"
     else:
-        signal = None
-
-    return signal, round(up,2), round(down,2)
+        return None
 
 # =========================
 # STATE
@@ -110,10 +104,10 @@ state = {
     m: {
         "history": [],
         "price": None,
-        "signal": None,
-        "clob": None,
-        "up": 0,
-        "down": 0,
+        "pattern": None,
+        "poly": None,
+        "yes": None,
+        "no": None,
         "timer": "00:00",
         "bet": "None"
     } for m in markets
@@ -135,16 +129,17 @@ def run_market(m):
         secs = countdown % 60
         s["timer"] = f"{mins:02d}:{secs:02d}"
 
+        # Coinbase price
         price = get_price(symbols[m])
         if not price:
             continue
-
         s["price"] = price
 
-        clob, up, down = get_clob_sentiment(m)
-        s["clob"] = clob
-        s["up"] = up
-        s["down"] = down
+        # 🔥 Polymarket prices
+        yes, no = get_polymarket_prices(m)
+        s["yes"] = yes
+        s["no"] = no
+        s["poly"] = get_poly_signal(yes, no)
 
         if last_round is None:
             last_round = end
@@ -158,17 +153,19 @@ def run_market(m):
             if len(s["history"]) > 7:
                 s["history"].pop(0)
 
+            # Pattern
             if len(s["history"]) >= 3:
                 last3 = s["history"][-3:]
                 if last3 == ["UP","UP","UP"]:
-                    s["signal"] = "DOWN"
+                    s["pattern"] = "DOWN"
                 elif last3 == ["DOWN","DOWN","DOWN"]:
-                    s["signal"] = "UP"
+                    s["pattern"] = "UP"
                 else:
-                    s["signal"] = None
+                    s["pattern"] = None
 
-            if s["signal"] and s["signal"] == s["clob"]:
-                s["bet"] = s["signal"]
+            # Final decision
+            if s["pattern"] and s["pattern"] == s["poly"]:
+                s["bet"] = s["pattern"]
             else:
                 s["bet"] = "None"
 
@@ -193,7 +190,10 @@ def start():
 # =========================
 @app.route("/data")
 def data():
-    return jsonify({"state": state, "uptime": get_uptime()})
+    return jsonify({
+        "state": state,
+        "uptime": get_uptime()
+    })
 
 # =========================
 # UI
@@ -202,15 +202,17 @@ HTML = """
 <html>
 <script>
 async function load(){
- let r=await fetch('/data'); let d=await r.json();
+ let r=await fetch('/data');
+ let d=await r.json();
 
  document.getElementById("up").innerText=d.uptime;
 
  for (const [m,s] of Object.entries(d.state)){
   document.getElementById(m+"_p").innerText=s.price||"-";
-  document.getElementById(m+"_sig").innerText=s.signal||"-";
-  document.getElementById(m+"_clob").innerText=s.clob||"-";
-  document.getElementById(m+"_liq").innerText="UP:"+s.up+" DOWN:"+s.down;
+  document.getElementById(m+"_pattern").innerText=s.pattern||"-";
+  document.getElementById(m+"_poly").innerText=s.poly||"-";
+  document.getElementById(m+"_yes").innerText=s.yes||"-";
+  document.getElementById(m+"_no").innerText=s.no||"-";
   document.getElementById(m+"_hist").innerText=s.history.join(",");
   document.getElementById(m+"_timer").innerText=s.timer;
   document.getElementById(m+"_bet").innerText=s.bet;
@@ -227,9 +229,10 @@ setInterval(load,3000);
 <h3>{{m}}</h3>
 <p>Timer: <span id="{{m}}_timer"></span></p>
 <p>Price: <span id="{{m}}_p"></span></p>
-<p>Pattern: <span id="{{m}}_sig"></span></p>
-<p>CLOB: <span id="{{m}}_clob"></span></p>
-<p>Liquidity: <span id="{{m}}_liq"></span></p>
+<p>YES (UP): <span id="{{m}}_yes"></span></p>
+<p>NO (DOWN): <span id="{{m}}_no"></span></p>
+<p>Pattern: <span id="{{m}}_pattern"></span></p>
+<p>Polymarket: <span id="{{m}}_poly"></span></p>
 <p>Bet: <span id="{{m}}_bet"></span></p>
 <p>History: <span id="{{m}}_hist"></span></p>
 </div>
@@ -242,5 +245,8 @@ setInterval(load,3000);
 def home():
     return render_template_string(HTML, state=state)
 
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
