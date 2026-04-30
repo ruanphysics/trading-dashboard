@@ -9,9 +9,8 @@ from flask import Flask, render_template_string
 # =========================
 # SETTINGS
 # =========================
-markets = ["BTC-USD", "ETH-USD", "XRP-USD", "SOL-USD"]
+markets = ["bitcoin", "ethereum", "ripple", "solana"]
 stake_levels = [4, 8, 16]
-
 STATE_FILE = "state.json"
 
 bankroll = 100
@@ -20,19 +19,91 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# LOAD / SAVE
+# FETCH MARKETS
+# =========================
+def fetch_markets():
+    try:
+        url = "https://gamma-api.polymarket.com/markets"
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return None
+
+# =========================
+# GET MARKET INFO (price + end time)
+# =========================
+def get_market_info(asset):
+    data = fetch_markets()
+    if not data:
+        return None, None
+
+    try:
+        for m in data:
+            title = m.get("question", "").lower()
+
+            if asset in title and "higher" in title and m.get("active", True):
+                outcomes = m.get("outcomes", [])
+                if outcomes and "price" in outcomes[0]:
+
+                    price = float(outcomes[0]["price"])
+                    end_time = m.get("endDate")
+
+                    if 0 < price < 1:
+                        return price, end_time
+
+        return None, None
+    except:
+        return None, None
+
+# =========================
+# SAFE PRICE FETCH
+# =========================
+def safe_get_info(asset, last_price):
+    for _ in range(3):
+        price, end_time = get_market_info(asset)
+        if price is not None:
+            return price, end_time
+        time.sleep(2)
+
+    return last_price, None
+
+# =========================
+# COUNTDOWN
+# =========================
+def get_time_remaining(end_time):
+    try:
+        if not end_time:
+            return "--:--"
+
+        end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+
+        diff = (end - now).total_seconds()
+
+        if diff <= 0:
+            return "00:00"
+
+        mins = int(diff // 60)
+        secs = int(diff % 60)
+
+        return f"{mins:02d}:{secs:02d}"
+    except:
+        return "--:--"
+
+# =========================
+# SAVE / LOAD
 # =========================
 def save_state():
-    data = {
-        "bankroll": bankroll,
-        "state": state
-    }
-    with open(STATE_FILE, "w") as f:
-        json.dump(data, f)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"bankroll": bankroll, "state": state}, f)
+    except:
+        pass
 
 def load_state():
-    global bankroll, state
-
+    global bankroll
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -56,49 +127,15 @@ for m in markets:
         "step": 0,
         "profit": 0,
         "entry_price": None,
-        "entry_time": None,
         "current_bet": 0,
         "expected_profit": 0,
-        "last_update": "Starting..."
+        "last_price": None,
+        "last_update": "Starting...",
+        "countdown": "--:--"
     }
 
 loaded = load_state()
-
-if loaded:
-    state = loaded
-else:
-    state = default_state
-
-# =========================
-# TIME
-# =========================
-def wait_for_next_candle():
-    now = datetime.now(timezone.utc)
-    seconds = now.minute * 60 + now.second
-    return 300 - (seconds % 300)
-
-def get_countdown():
-    now = datetime.now(timezone.utc)
-    seconds = now.minute * 60 + now.second
-    remaining = 300 - (seconds % 300)
-    return f"{remaining//60:02d}:{remaining%60:02d}"
-
-# =========================
-# DATA
-# =========================
-def get_last_two_closes(market):
-    try:
-        url = f"https://api.exchange.coinbase.com/products/{market}/candles?granularity=300"
-        data = requests.get(url, timeout=10).json()
-
-        if len(data) < 2:
-            return None, None
-
-        return data[1][4], data[0][4]
-
-    except Exception as e:
-        print("API ERROR:", e)
-        return None, None
+state = loaded if loaded else default_state
 
 # =========================
 # BOT
@@ -111,24 +148,31 @@ def run_market(m):
 
     while True:
         try:
-            wait = wait_for_next_candle()
-            time.sleep(wait + 2)
+            time.sleep(60)  # check every minute (better timing)
 
-            prev_close, last_close = get_last_two_closes(m)
+            price, end_time = safe_get_info(m, s["last_price"])
 
-            if prev_close is None:
+            if price is None:
                 s["last_update"] = "No data"
+                continue
+
+            s["countdown"] = get_time_remaining(end_time)
+
+            if s["last_price"] is None:
+                s["last_price"] = price
                 continue
 
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
             # STREAK
-            if last_close > prev_close:
+            if price > s["last_price"]:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
-            else:
+            elif price < s["last_price"]:
                 s["down_streak"] += 1
                 s["up_streak"] = 0
+
+            s["last_price"] = price
 
             # ENTRY
             if not s["in_trade"]:
@@ -145,23 +189,27 @@ def run_market(m):
             # TRADE LOOP
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
+                entry_price = s["last_price"]
 
                 s["current_bet"] = bet
-                s["expected_profit"] = bet * 0.75
+                s["entry_price"] = entry_price
+                s["expected_profit"] = round(bet * (1 - entry_price), 2)
 
-                wait = wait_for_next_candle()
-                time.sleep(wait + 2)
+                time.sleep(300)
 
-                prev_close, new_close = get_last_two_closes(m)
+                new_price, _ = safe_get_info(m, entry_price)
+
+                if new_price is None:
+                    continue
 
                 win = False
-                if s["trade_direction"] == "DOWN" and new_close < prev_close:
+                if s["trade_direction"] == "DOWN" and new_price < entry_price:
                     win = True
-                elif s["trade_direction"] == "UP" and new_close > prev_close:
+                elif s["trade_direction"] == "UP" and new_price > entry_price:
                     win = True
 
                 if win:
-                    profit = bet * 0.75
+                    profit = bet * (1 - entry_price)
                     with bankroll_lock:
                         bankroll += profit
 
@@ -172,10 +220,11 @@ def run_market(m):
                     break
 
                 else:
+                    loss = bet * entry_price
                     with bankroll_lock:
-                        bankroll -= bet
+                        bankroll -= loss
 
-                    s["profit"] -= bet
+                    s["profit"] -= loss
                     s["step"] += 1
 
             if s["in_trade"] and s["step"] >= len(stake_levels):
@@ -183,7 +232,6 @@ def run_market(m):
                 s["up_streak"] = 0
                 s["down_streak"] = 0
 
-            # 💾 SAVE EVERY LOOP
             save_state()
 
         except Exception as e:
@@ -208,18 +256,29 @@ def start_once():
 # =========================
 HTML = """
 <html>
-<head><meta http-equiv="refresh" content="3"></head>
+<head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Dashboard</h1>
+<h1>Polymarket Bot</h1>
 <h2>Bank: ${{bankroll}}</h2>
-<h3>Next Candle: {{countdown}}</h3>
 
 {% for m,s in state.items() %}
 <div style="margin:10px;padding:10px;background:#1e293b">
 <h3>{{m}}</h3>
+
+<p>⏳ {{s.countdown}}</p>
 <p>U:{{s.up_streak}} D:{{s.down_streak}}</p>
+<p>Last price: {{s.last_price}}</p>
 <p>Last update: {{s.last_update}}</p>
+
+{% if s.in_trade %}
+<p>Trading {{s.trade_direction}} (step {{s.step+1}})</p>
+<p>Bet: ${{s.current_bet}}</p>
+<p>Expected profit: ${{s.expected_profit}}</p>
+{% else %}
+<p>Idle</p>
+{% endif %}
+
 <p>Profit: {{s.profit}}</p>
 </div>
 {% endfor %}
@@ -233,6 +292,11 @@ def dashboard():
     return render_template_string(
         HTML,
         state=state,
-        bankroll=round(bankroll, 2),
-        countdown=get_countdown()
+        bankroll=round(bankroll, 2)
     )
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
