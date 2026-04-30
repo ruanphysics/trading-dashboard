@@ -141,8 +141,12 @@ def run_market(m):
                 s["start_price"] = price
                 continue
 
-            if end != last_round_end:
+            # ✅ FIXED: ensure immediate detection of new round
+            if end > last_round_end:
                 end_price = price
+
+                # ✅ clear pending immediately on round close
+                s["pending"] = False
 
                 if end_price > s["start_price"]:
                     outcome = "UP"
@@ -180,16 +184,12 @@ def run_market(m):
                     s["bet"] = bet
 
                     if s["just_entered"]:
-                        # skip evaluation this round
                         s["just_entered"] = False
                     else:
-                        # settle trade
                         win = (
                             (s["trade_direction"] == "UP" and outcome == "UP") or
                             (s["trade_direction"] == "DOWN" and outcome == "DOWN")
                         )
-
-                        s["pending"] = False
 
                         if win:
                             profit = bet * 0.75
@@ -216,7 +216,6 @@ def run_market(m):
                                 s["trade_direction"] = None
                                 s["step"] = 0
                             else:
-                                # next step continues
                                 s["just_entered"] = True
                                 s["pending"] = True
 
@@ -281,11 +280,10 @@ async function fetchData() {
         document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
         document.getElementById(m+"_round").innerText = s.round;
 
-        // ✅ PROFIT DISPLAY
         if(s.pending){
-            document.getElementById(m+"_profit").innerText = "PENDING";
+            document.getElementById(m+"_profit").innerText = "Pending";
         } else {
-            document.getElementById(m+"_profit").innerText = s.profit.toFixed(2);
+            document.getElementById(m+"_profit").innerText = "$" + s.profit.toFixed(2);
         }
 
         let sec = s.countdown;
@@ -328,7 +326,7 @@ Uptime: <span id="uptime">00:00:00</span>
 
 <p>Active Bet: <span id="{{m}}_trade">None</span></p>
 
-<p>Profit: $<span id="{{m}}_profit">0</span></p>
+<p>Profit: <span id="{{m}}_profit">0</span></p>
 
 </div>
 {% endfor %}
