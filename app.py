@@ -21,7 +21,7 @@ app = Flask(__name__)
 ET = pytz.timezone("America/New_York")
 START_TIME = time.time()
 
-# 🔥 shared memory (updated by worker)
+# 🔥 STORE WORKER DATA HERE
 poly_data = {
     m: {"yes": None, "no": None}
     for m in markets
@@ -63,11 +63,13 @@ def get_poly_signal(yes, no):
     return None
 
 # =========================
-# 🔥 API RECEIVER (NEW)
+# 🔥 RECEIVE DATA FROM WORKER
 # =========================
 @app.route("/update", methods=["POST"])
 def update():
     data = request.json
+
+    print("RECEIVED:", data)  # 👈 IMPORTANT FOR DEBUG
 
     for m in markets:
         if m in data:
@@ -113,7 +115,7 @@ def run_market(m):
 
         s["price"] = price
 
-        # 🔥 use worker data
+        # 🔥 USE WORKER DATA
         yes = poly_data[m]["yes"]
         no = poly_data[m]["no"]
 
