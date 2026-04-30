@@ -63,26 +63,6 @@ def get_coinbase_price(symbol):
     except:
         return None
 
-def get_poly_price():
-    try:
-        url = "https://gamma-api.polymarket.com/events"
-        res = requests.get(url, timeout=5)
-        if res.status_code != 200:
-            return 0.5
-
-        data = res.json()
-        for e in data:
-            markets = e.get("markets", [])
-            if markets:
-                outcomes = markets[0].get("outcomes", [])
-                if outcomes:
-                    p = float(outcomes[0]["price"])
-                    if 0 < p < 1:
-                        return p
-        return 0.5
-    except:
-        return 0.5
-
 # =========================
 # SAVE / LOAD
 # =========================
@@ -120,8 +100,8 @@ for m in markets:
         "step": 0,
         "profit": 0,
         "bet": 0,
-        "entry_price": None,
-        "expected_profit": 0,
+        "pending": False,
+        "just_entered": False,
         "round": "",
         "countdown": 0,
         "last_update": "Starting..."
@@ -144,7 +124,6 @@ def run_market(m):
             time.sleep(3)
 
             start, end = get_round_times()
-
             next_start = end
             next_end = end + 300
 
@@ -152,7 +131,6 @@ def run_market(m):
             s["countdown"] = get_countdown_seconds()
 
             price = get_coinbase_price(symbols[m])
-
             if price is None:
                 continue
 
@@ -173,13 +151,12 @@ def run_market(m):
                 else:
                     outcome = "FLAT"
 
-                # LIMIT HISTORY
                 if outcome != "FLAT":
                     s["history"].append(outcome)
                     if len(s["history"]) > 7:
                         s["history"].pop(0)
 
-                # STRATEGY
+                # SIGNAL
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
                     if last3 == ["UP","UP","UP"]:
@@ -194,50 +171,54 @@ def run_market(m):
                     s["in_trade"] = True
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
+                    s["just_entered"] = True
+                    s["pending"] = True
 
-                # EXECUTE
+                # EXECUTION
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
-
                     s["bet"] = bet
-                    s["entry_price"] = None
-                    s["expected_profit"] = round(bet * 0.75, 2)
 
-                    win = (
-                        (s["trade_direction"] == "UP" and outcome == "UP") or
-                        (s["trade_direction"] == "DOWN" and outcome == "DOWN")
-                    )
-
-                    if win:
-                        profit = bet * 0.75
-
-                        with bankroll_lock:
-                            bankroll += profit
-
-                        s["profit"] += profit
-
-                        # RESET AFTER WIN
-                        s["in_trade"] = False
-                        s["signal"] = None
-                        s["trade_direction"] = None
-                        s["step"] = 0
-
+                    if s["just_entered"]:
+                        # skip evaluation this round
+                        s["just_entered"] = False
                     else:
-                        loss = bet
+                        # settle trade
+                        win = (
+                            (s["trade_direction"] == "UP" and outcome == "UP") or
+                            (s["trade_direction"] == "DOWN" and outcome == "DOWN")
+                        )
 
-                        with bankroll_lock:
-                            bankroll -= loss
+                        s["pending"] = False
 
-                        s["profit"] -= loss
+                        if win:
+                            profit = bet * 0.75
+                            with bankroll_lock:
+                                bankroll += profit
+                            s["profit"] += profit
 
-                        s["step"] += 1
-
-                        if s["step"] >= len(stake_levels):
-                            # RESET AFTER FULL LOSS
                             s["in_trade"] = False
                             s["signal"] = None
                             s["trade_direction"] = None
                             s["step"] = 0
+
+                        else:
+                            loss = bet
+                            with bankroll_lock:
+                                bankroll -= loss
+                            s["profit"] -= loss
+
+                            s["step"] += 1
+
+                            if s["step"] >= len(stake_levels):
+                                s["in_trade"] = False
+                                s["signal"] = None
+                                s["trade_direction"] = None
+                                s["step"] = 0
+                            else:
+                                # next step continues
+                                s["just_entered"] = True
+                                s["pending"] = True
 
                 s["start_price"] = price
                 last_round_end = end
@@ -299,7 +280,13 @@ async function fetchData() {
         document.getElementById(m+"_signal").innerText = s.signal ?? "-";
         document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
         document.getElementById(m+"_round").innerText = s.round;
-        document.getElementById(m+"_profit").innerText = s.profit.toFixed(2);
+
+        // ✅ PROFIT DISPLAY
+        if(s.pending){
+            document.getElementById(m+"_profit").innerText = "PENDING";
+        } else {
+            document.getElementById(m+"_profit").innerText = s.profit.toFixed(2);
+        }
 
         let sec = s.countdown;
         let min = String(Math.floor(sec/60)).padStart(2,'0');
@@ -308,7 +295,7 @@ async function fetchData() {
 
         if(s.in_trade){
             document.getElementById(m+"_trade").innerText =
-                s.trade_direction + " | $" + s.bet + " | step " + (s.step+1);
+                s.trade_direction + " | $" + s.bet + " | Step " + (s.step+1);
         } else {
             document.getElementById(m+"_trade").innerText = "None";
         }
