@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: polymarket-bot
+    env: python
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+      PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: 0
