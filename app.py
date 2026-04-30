@@ -173,7 +173,7 @@ def run_market(m):
                 else:
                     outcome = "FLAT"
 
-                # ✅ LIMIT HISTORY TO 7
+                # LIMIT HISTORY
                 if outcome != "FLAT":
                     s["history"].append(outcome)
                     if len(s["history"]) > 7:
@@ -198,11 +198,10 @@ def run_market(m):
                 # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
-                    entry_price = get_poly_price()
 
                     s["bet"] = bet
-                    s["entry_price"] = entry_price
-                    s["expected_profit"] = round(bet * (1 - entry_price), 2)
+                    s["entry_price"] = None
+                    s["expected_profit"] = round(bet * 0.75, 2)
 
                     win = (
                         (s["trade_direction"] == "UP" and outcome == "UP") or
@@ -210,28 +209,35 @@ def run_market(m):
                     )
 
                     if win:
-                        profit = bet * (1 - entry_price)
+                        profit = bet * 0.75
+
                         with bankroll_lock:
                             bankroll += profit
+
                         s["profit"] += profit
 
-                        # ✅ FULL RESET AFTER WIN
+                        # RESET AFTER WIN
                         s["in_trade"] = False
                         s["signal"] = None
                         s["trade_direction"] = None
                         s["step"] = 0
 
                     else:
-                        loss = bet * entry_price
+                        loss = bet
+
                         with bankroll_lock:
                             bankroll -= loss
+
                         s["profit"] -= loss
+
                         s["step"] += 1
 
                         if s["step"] >= len(stake_levels):
+                            # RESET AFTER FULL LOSS
                             s["in_trade"] = False
                             s["signal"] = None
                             s["trade_direction"] = None
+                            s["step"] = 0
 
                 s["start_price"] = price
                 last_round_end = end
