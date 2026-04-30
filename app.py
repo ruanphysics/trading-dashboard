@@ -1,8 +1,6 @@
 import requests
 import time
 import threading
-import json
-import os
 from datetime import datetime
 import pytz
 from flask import Flask, jsonify, render_template_string
@@ -27,38 +25,40 @@ symbols = {
 }
 
 stake_levels = [4, 8, 16]
-STATE_FILE = "state.json"
 
 bankroll = 100
-bankroll_lock = threading.Lock()
-
 app = Flask(__name__)
+
 ET = pytz.timezone("America/New_York")
 START_TIME = time.time()
 
 # =========================
+# TOKEN CACHE
+# =========================
+token_cache = {}
+token_cache_time = {}
+
+# =========================
 # TIME
 # =========================
-def get_et_timestamp():
-    return int(datetime.now(ET).timestamp())
+def get_et_now():
+    return datetime.now(ET)
 
-def get_round_times():
-    now = get_et_timestamp()
+def get_round_info():
+    now = int(get_et_now().timestamp())
     end = now - (now % 300)
     start = end - 300
-    return start, end
-
-def get_countdown_seconds():
-    return 300 - (get_et_timestamp() % 300)
+    countdown = 300 - (now % 300)
+    return start, end, countdown
 
 def get_uptime():
     s = int(time.time() - START_TIME)
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 # =========================
-# COINBASE PRICE
+# PRICE
 # =========================
-def get_coinbase_price(symbol):
+def get_price(symbol):
     try:
         r = requests.get(f"https://api.exchange.coinbase.com/products/{symbol}/ticker", timeout=5).json()
         return float(r["price"])
@@ -66,59 +66,56 @@ def get_coinbase_price(symbol):
         return None
 
 # =========================
-# 🔥 AUTO TOKEN ID EXTRACTOR
+# TOKEN EXTRACTOR (FIXED)
 # =========================
 def get_token_ids(market):
+    now = time.time()
+
+    if market in token_cache and now - token_cache_time.get(market, 0) < 60:
+        return token_cache[market]
+
     try:
         slug = slug_map[market]
 
-        res = requests.get("https://gamma-api.polymarket.com/events", timeout=5)
-        if res.status_code != 200:
-            return None, None
-
+        res = requests.get("https://gamma-api.polymarket.com/markets", timeout=5)
         data = res.json()
 
-        # filter matching slug
-        matches = [e for e in data if slug in e.get("slug", "")]
+        matches = [m for m in data if slug in m.get("slug", "")]
 
         if not matches:
             return None, None
 
-        # get latest timestamp
         latest = max(matches, key=lambda x: int(x["slug"].split("-")[-1]))
 
-        markets_data = latest.get("markets", [])
-        if not markets_data:
-            return None, None
-
-        outcomes = markets_data[0].get("outcomes", [])
-
+        outcomes = latest.get("outcomes", [])
         if len(outcomes) < 2:
             return None, None
 
-        yes_token = outcomes[0].get("token_id")
-        no_token = outcomes[1].get("token_id")
+        yes_token = outcomes[0]["token_id"]
+        no_token = outcomes[1]["token_id"]
+
+        token_cache[market] = (yes_token, no_token)
+        token_cache_time[market] = now
 
         return yes_token, no_token
 
-    except:
+    except Exception as e:
+        print("TOKEN ERROR:", e)
         return None, None
 
 # =========================
 # CLOB
 # =========================
-def get_clob_data(token_id):
-    if not token_id:
+def get_clob(token):
+    if not token:
         return None
     try:
-        r = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5).json()
-
+        r = requests.get(f"https://clob.polymarket.com/book?token_id={token}", timeout=5).json()
         bids = r.get("bids", [])
         asks = r.get("asks", [])
 
         bid_liq = sum(float(b[1]) for b in bids[:5])
         ask_liq = sum(float(a[1]) for a in asks[:5])
-
         best_bid = float(bids[0][0]) if bids else 0
 
         return bid_liq, ask_liq, best_bid
@@ -128,85 +125,80 @@ def get_clob_data(token_id):
 def get_clob_sentiment(market):
     yes_id, no_id = get_token_ids(market)
 
-    yes = get_clob_data(yes_id)
-    no = get_clob_data(no_id)
+    yes = get_clob(yes_id)
+    no = get_clob(no_id)
 
     if not yes or not no:
         return None, 0, 0, 0
 
-    up_liq = yes[0]
-    down_liq = no[0]
+    up = yes[0]
+    down = no[0]
     best_bid = yes[2]
 
-    if up_liq > down_liq * 1.2:
-        signal = "UP"
-    elif down_liq > up_liq * 1.2:
-        signal = "DOWN"
+    if up > down * 1.2:
+        sig = "UP"
+    elif down > up * 1.2:
+        sig = "DOWN"
     else:
-        signal = None
+        sig = None
 
-    return signal, round(up_liq,2), round(down_liq,2), best_bid
+    return sig, round(up,2), round(down,2), best_bid
 
 # =========================
 # STATE
 # =========================
-default_state = {
+state = {
     m: {
         "history": [],
-        "start_price": None,
-        "current_price": None,
+        "price": None,
         "signal": None,
-        "clob_signal": None,
-        "up_liq": 0,
-        "down_liq": 0,
-        "best_bid": 0,
-        "in_trade": False,
-        "trade_direction": None,
-        "step": 0,
-        "profit": 0,
+        "clob": None,
+        "up": 0,
+        "down": 0,
+        "timer": "00:00",
         "round": "",
-        "countdown": 0,
-        "last_update": "Starting..."
+        "bet": "None"
     } for m in markets
 }
 
-state = default_state
-
 # =========================
-# BOT
+# BOT LOOP
 # =========================
 def run_market(m):
-    global bankroll
     s = state[m]
     last_round = None
 
     while True:
         time.sleep(3)
 
-        start, end = get_round_times()
-        s["countdown"] = get_countdown_seconds()
+        start, end, countdown = get_round_info()
+
+        # TIMER (Polymarket style)
+        mins = countdown // 60
+        secs = countdown % 60
+        s["timer"] = f"{mins:02d}:{secs:02d}"
+
         s["round"] = datetime.fromtimestamp(end, ET).strftime("%H:%M")
 
-        price = get_coinbase_price(symbols[m])
+        price = get_price(symbols[m])
         if not price:
             continue
 
-        s["current_price"] = price
+        s["price"] = price
 
-        # 🔥 CLOB UPDATE
-        clob_signal, up_liq, down_liq, best_bid = get_clob_sentiment(m)
-        s["clob_signal"] = clob_signal
-        s["up_liq"] = up_liq
-        s["down_liq"] = down_liq
-        s["best_bid"] = best_bid
+        # CLOB
+        clob, up, down, _ = get_clob_sentiment(m)
+        s["clob"] = clob
+        s["up"] = up
+        s["down"] = down
 
         if last_round is None:
             last_round = end
-            s["start_price"] = price
+            s["start"] = price
             continue
 
         if end != last_round:
-            outcome = "UP" if price > s["start_price"] else "DOWN"
+            outcome = "UP" if price > s["start"] else "DOWN"
 
             s["history"].append(outcome)
             if len(s["history"]) > 7:
@@ -222,57 +214,34 @@ def run_market(m):
                 else:
                     s["signal"] = None
 
-            # ENTRY
-            if s["signal"] and not s["in_trade"]:
-                if s["signal"] == s["clob_signal"]:
-                    s["in_trade"] = True
-                    s["trade_direction"] = s["signal"]
-                    s["step"] = 0
+            # SHOW BET DECISION
+            if s["signal"] and s["signal"] == s["clob"]:
+                s["bet"] = s["signal"]
+            else:
+                s["bet"] = "None"
 
-            # EXECUTION
-            if s["in_trade"]:
-                bet = stake_levels[s["step"]]
-                win = (
-                    (s["trade_direction"]=="UP" and outcome=="UP") or
-                    (s["trade_direction"]=="DOWN" and outcome=="DOWN")
-                )
-
-                if win:
-                    bankroll += bet
-                    s["profit"] += bet
-                    s["in_trade"] = False
-                    s["signal"] = None
-                else:
-                    bankroll -= bet
-                    s["profit"] -= bet
-                    s["step"] += 1
-                    if s["step"] >= len(stake_levels):
-                        s["in_trade"] = False
-                        s["signal"] = None
-
-            s["start_price"] = price
+            s["start"] = price
             last_round = end
-
-        s["last_update"] = datetime.now(ET).strftime("%H:%M:%S")
 
 # =========================
 # START THREADS
 # =========================
-started=False
+started = False
+
 @app.before_request
 def start():
     global started
     if not started:
         for m in markets:
-            threading.Thread(target=run_market,args=(m,),daemon=True).start()
-        started=True
+            threading.Thread(target=run_market, args=(m,), daemon=True).start()
+        started = True
 
 # =========================
 # API
 # =========================
 @app.route("/data")
 def data():
-    return jsonify({"state":state,"bankroll":bankroll,"uptime":get_uptime()})
+    return jsonify({"state": state, "uptime": get_uptime()})
 
 # =========================
 # UI
@@ -282,31 +251,34 @@ HTML = """
 <script>
 async function load(){
  let r=await fetch('/data'); let d=await r.json();
- document.getElementById("bank").innerText=d.bankroll;
+
  document.getElementById("up").innerText=d.uptime;
 
  for (const [m,s] of Object.entries(d.state)){
+  document.getElementById(m+"_p").innerText=s.price||"-";
   document.getElementById(m+"_sig").innerText=s.signal||"-";
-  document.getElementById(m+"_clob").innerText=s.clob_signal||"-";
-  document.getElementById(m+"_liq").innerText="UP:"+s.up_liq+" DOWN:"+s.down_liq;
-  document.getElementById(m+"_price").innerText=s.current_price||"-";
+  document.getElementById(m+"_clob").innerText=s.clob||"-";
+  document.getElementById(m+"_liq").innerText="UP:"+s.up+" DOWN:"+s.down;
   document.getElementById(m+"_hist").innerText=s.history.join(",");
+  document.getElementById(m+"_timer").innerText=s.timer;
+  document.getElementById(m+"_bet").innerText=s.bet;
  }
 }
 setInterval(load,3000);
 </script>
 
 <body style="background:#111;color:white">
-<h2>Bank: $<span id="bank"></span></h2>
-<div>Uptime: <span id="up"></span></div>
+<h2>Uptime: <span id="up"></span></h2>
 
 {% for m in state %}
 <div style="border:1px solid #444;margin:10px;padding:10px">
 <h3>{{m}}</h3>
+<p>Timer: <span id="{{m}}_timer"></span></p>
+<p>Price: <span id="{{m}}_p"></span></p>
 <p>Pattern: <span id="{{m}}_sig"></span></p>
 <p>CLOB: <span id="{{m}}_clob"></span></p>
 <p>Liquidity: <span id="{{m}}_liq"></span></p>
-<p>Price: <span id="{{m}}_price"></span></p>
+<p>Bet: <span id="{{m}}_bet"></span></p>
 <p>History: <span id="{{m}}_hist"></span></p>
 </div>
 {% endfor %}
@@ -316,7 +288,7 @@ setInterval(load,3000);
 
 @app.route("/")
 def home():
-    return render_template_string(HTML,state=state)
+    return render_template_string(HTML, state=state)
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=10000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
