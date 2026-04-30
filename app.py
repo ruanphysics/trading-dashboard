@@ -27,7 +27,7 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 ET = pytz.timezone("America/New_York")
-START_TIME = time.time()  # 🔥 uptime tracker
+START_TIME = time.time()
 
 # =========================
 # TIME
@@ -173,11 +173,13 @@ def run_market(m):
                 else:
                     outcome = "FLAT"
 
+                # ✅ LIMIT HISTORY TO 7
                 if outcome != "FLAT":
                     s["history"].append(outcome)
-                    if len(s["history"]) > 10:
+                    if len(s["history"]) > 7:
                         s["history"].pop(0)
 
+                # STRATEGY
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
                     if last3 == ["UP","UP","UP"]:
@@ -187,11 +189,13 @@ def run_market(m):
                     else:
                         s["signal"] = None
 
+                # ENTER TRADE
                 if s["signal"] and not s["in_trade"]:
                     s["in_trade"] = True
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
 
+                # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
                     entry_price = get_poly_price()
@@ -210,7 +214,13 @@ def run_market(m):
                         with bankroll_lock:
                             bankroll += profit
                         s["profit"] += profit
+
+                        # ✅ FULL RESET AFTER WIN
                         s["in_trade"] = False
+                        s["signal"] = None
+                        s["trade_direction"] = None
+                        s["step"] = 0
+
                     else:
                         loss = bet * entry_price
                         with bankroll_lock:
@@ -220,6 +230,8 @@ def run_market(m):
 
                         if s["step"] >= len(stake_levels):
                             s["in_trade"] = False
+                            s["signal"] = None
+                            s["trade_direction"] = None
 
                 s["start_price"] = price
                 last_round_end = end
@@ -303,7 +315,7 @@ setInterval(fetchData, 3000);
 
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Advanced)</h1>
+<h1>Hybrid Bot (Final)</h1>
 <h2>Bank: $<span id="bank">...</span></h2>
 
 <div style="position:fixed;top:10px;right:20px;color:#94a3b8">
