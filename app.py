@@ -19,23 +19,21 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# TIMER (5-MIN CYCLE)
+# TIMER
 # =========================
 def get_countdown():
     now = datetime.utcnow()
     seconds = now.minute * 60 + now.second
     remaining = 300 - (seconds % 300)
-
-    mins = remaining // 60
-    secs = remaining % 60
-    return f"{mins:02d}:{secs:02d}", remaining
+    return f"{remaining//60:02d}:{remaining%60:02d}", remaining
 
 # =========================
-# AUTO MARKET ID
+# MARKET SLUG (ROBUST)
 # =========================
-def get_market_slug(asset):
+def get_possible_slugs(asset):
     now = int(time.time())
-    round_time = now - (now % 300)
+
+    base = now - (now % 300)
 
     prefix_map = {
         "bitcoin": "btc",
@@ -44,31 +42,36 @@ def get_market_slug(asset):
         "solana": "sol"
     }
 
-    return f"{prefix_map[asset]}-updown-5m-{round_time}"
+    prefix = prefix_map[asset]
+
+    # Try previous, current, next round
+    return [
+        f"{prefix}-updown-5m-{base - 300}",
+        f"{prefix}-updown-5m-{base}",
+        f"{prefix}-updown-5m-{base + 300}"
+    ]
 
 # =========================
-# POLYMARKET PRICE
+# POLYMARKET FETCH
 # =========================
 def get_polymarket_price(asset):
     try:
-        slug = get_market_slug(asset)
-        url = f"https://gamma-api.polymarket.com/markets/{slug}"
+        slugs = get_possible_slugs(asset)
 
-        res = requests.get(url, timeout=5)
+        for slug in slugs:
+            url = f"https://gamma-api.polymarket.com/markets/{slug}"
+            res = requests.get(url, timeout=5)
 
-        if res.status_code != 200:
-            return None
+            if res.status_code != 200:
+                continue
 
-        data = res.json()
-        outcomes = data.get("outcomes", [])
+            data = res.json()
+            outcomes = data.get("outcomes", [])
 
-        if not outcomes:
-            return None
-
-        price = float(outcomes[0]["price"])
-
-        if 0 < price < 1:
-            return price
+            if outcomes:
+                price = float(outcomes[0]["price"])
+                if 0 < price < 1:
+                    return price
 
         return None
 
@@ -129,15 +132,13 @@ def run_market(m):
     global bankroll
     s = state[m]
 
-    print(f"STARTED: {m}")
-
     last_cycle = None
 
     while True:
         try:
             time.sleep(5)
 
-            countdown, remaining = get_countdown()
+            countdown, _ = get_countdown()
             s["countdown"] = countdown
 
             price = get_polymarket_price(m)
@@ -147,7 +148,6 @@ def run_market(m):
                 continue
 
             s["current_price"] = price
-
             current_cycle = int(time.time() // 300)
 
             if last_cycle is None:
@@ -155,10 +155,9 @@ def run_market(m):
                 s["last_round_price"] = price
                 continue
 
-            # NEW ROUND DETECTED
+            # NEW ROUND
             if current_cycle != last_cycle:
 
-                # DETERMINE OUTCOME
                 if price > s["last_round_price"]:
                     outcome = "UP"
                 elif price < s["last_round_price"]:
@@ -175,9 +174,9 @@ def run_market(m):
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
 
-                    if last3 == ["UP", "UP", "UP"]:
+                    if last3 == ["UP","UP","UP"]:
                         s["signal"] = "DOWN"
-                    elif last3 == ["DOWN", "DOWN", "DOWN"]:
+                    elif last3 == ["DOWN","DOWN","DOWN"]:
                         s["signal"] = "UP"
                     else:
                         s["signal"] = None
@@ -188,7 +187,7 @@ def run_market(m):
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
 
-                # EXECUTE TRADE
+                # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
                     entry_price = price
@@ -197,25 +196,21 @@ def run_market(m):
                     s["entry_price"] = entry_price
                     s["expected_profit"] = round(bet * (1 - entry_price), 2)
 
-                    win = False
-                    if s["trade_direction"] == "UP" and outcome == "UP":
-                        win = True
-                    elif s["trade_direction"] == "DOWN" and outcome == "DOWN":
-                        win = True
+                    win = (
+                        (s["trade_direction"] == "UP" and outcome == "UP") or
+                        (s["trade_direction"] == "DOWN" and outcome == "DOWN")
+                    )
 
                     if win:
                         profit = bet * (1 - entry_price)
                         with bankroll_lock:
                             bankroll += profit
-
                         s["profit"] += profit
                         s["in_trade"] = False
-
                     else:
                         loss = bet * entry_price
                         with bankroll_lock:
                             bankroll -= loss
-
                         s["profit"] -= loss
                         s["step"] += 1
 
@@ -224,7 +219,6 @@ def run_market(m):
 
                 s["last_round_price"] = price
                 last_cycle = current_cycle
-
                 save_state()
 
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
@@ -253,7 +247,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Outcome Bot (Auto Markets)</h1>
+<h1>Outcome Bot (Stable)</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
@@ -284,11 +278,7 @@ HTML = """
 
 @app.route("/")
 def dashboard():
-    return render_template_string(
-        HTML,
-        state=state,
-        bankroll=round(bankroll, 2)
-    )
+    return render_template_string(HTML, state=state, bankroll=round(bankroll,2))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
