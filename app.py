@@ -3,13 +3,20 @@ import time
 import threading
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, render_template_string
 
 # =========================
 # SETTINGS
 # =========================
 markets = ["bitcoin", "ethereum", "ripple", "solana"]
+symbols = {
+    "bitcoin": "BTC-USD",
+    "ethereum": "ETH-USD",
+    "ripple": "XRP-USD",
+    "solana": "SOL-USD"
+}
+
 stake_levels = [4, 8, 16]
 STATE_FILE = "state.json"
 
@@ -19,57 +26,51 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# TIMER
+# TIMER (ALIGNED)
 # =========================
+def get_round_times():
+    now = int(time.time())
+    end = now - (now % 300)
+    start = end - 300
+    return start, end
+
 def get_countdown():
-    now = datetime.utcnow()
-    seconds = now.minute * 60 + now.second
-    remaining = 300 - (seconds % 300)
+    now = int(time.time())
+    remaining = 300 - (now % 300)
     return f"{remaining//60:02d}:{remaining%60:02d}", remaining
 
 # =========================
-# POLYMARKET (FIXED)
+# COINBASE PRICE
 # =========================
-def get_polymarket_price(asset):
+def get_coinbase_price(symbol):
+    try:
+        url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
+        res = requests.get(url, timeout=5).json()
+        return float(res["price"])
+    except:
+        return None
+
+# =========================
+# POLYMARKET PRICE (OPTIONAL)
+# =========================
+def get_poly_price():
     try:
         url = "https://gamma-api.polymarket.com/events"
         res = requests.get(url, timeout=5)
-
         if res.status_code != 200:
             return None
 
         data = res.json()
-
-        prefix_map = {
-            "bitcoin": "btc-updown-5m",
-            "ethereum": "eth-updown-5m",
-            "ripple": "xrp-updown-5m",
-            "solana": "sol-updown-5m"
-        }
-
-        keyword = prefix_map[asset]
-
-        for event in data:
-            slug = event.get("slug", "")
-
-            if keyword in slug:
-                markets = event.get("markets", [])
-
-                if markets:
-                    outcomes = markets[0].get("outcomes", [])
-
-                    if outcomes:
-                        try:
-                            price = float(outcomes[0]["price"])
-                            if 0 < price < 1:
-                                return price
-                        except:
-                            continue
-
+        for e in data:
+            markets = e.get("markets", [])
+            if markets:
+                outcomes = markets[0].get("outcomes", [])
+                if outcomes:
+                    p = float(outcomes[0]["price"])
+                    if 0 < p < 1:
+                        return p
         return None
-
-    except Exception as e:
-        print("POLY ERROR:", e)
+    except:
         return None
 
 # =========================
@@ -101,7 +102,8 @@ default_state = {}
 for m in markets:
     default_state[m] = {
         "history": [],
-        "last_round_price": None,
+        "start_price": None,
+        "end_price": None,
         "current_price": None,
         "signal": None,
         "in_trade": False,
@@ -112,7 +114,8 @@ for m in markets:
         "entry_price": None,
         "expected_profit": 0,
         "countdown": "--:--",
-        "last_update": "Starting..."
+        "last_update": "Starting...",
+        "round": "",
     }
 
 loaded = load_state()
@@ -125,7 +128,7 @@ def run_market(m):
     global bankroll
     s = state[m]
 
-    last_cycle = None
+    last_round_end = None
 
     while True:
         try:
@@ -134,26 +137,31 @@ def run_market(m):
             countdown, _ = get_countdown()
             s["countdown"] = countdown
 
-            price = get_polymarket_price(m)
+            start, end = get_round_times()
+            s["round"] = f"{datetime.utcfromtimestamp(start).strftime('%H:%M')} → {datetime.utcfromtimestamp(end).strftime('%H:%M')}"
+
+            price = get_coinbase_price(symbols[m])
 
             if price is None:
-                s["last_update"] = "Waiting for market..."
+                s["last_update"] = "No Coinbase data"
                 continue
 
             s["current_price"] = price
-            current_cycle = int(time.time() // 300)
 
-            if last_cycle is None:
-                last_cycle = current_cycle
-                s["last_round_price"] = price
+            # FIRST INIT
+            if last_round_end is None:
+                last_round_end = end
+                s["start_price"] = price
                 continue
 
-            # NEW ROUND
-            if current_cycle != last_cycle:
+            # NEW ROUND DETECTED
+            if end != last_round_end:
+                s["end_price"] = price
 
-                if price > s["last_round_price"]:
+                # DETERMINE OUTCOME
+                if s["end_price"] > s["start_price"]:
                     outcome = "UP"
-                elif price < s["last_round_price"]:
+                elif s["end_price"] < s["start_price"]:
                     outcome = "DOWN"
                 else:
                     outcome = "FLAT"
@@ -166,7 +174,6 @@ def run_market(m):
                 # STRATEGY
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
-
                     if last3 == ["UP","UP","UP"]:
                         s["signal"] = "DOWN"
                     elif last3 == ["DOWN","DOWN","DOWN"]:
@@ -180,10 +187,10 @@ def run_market(m):
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
 
-                # EXECUTE
+                # EXECUTE TRADE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
-                    entry_price = price
+                    entry_price = get_poly_price() or 0.5
 
                     s["bet"] = bet
                     s["entry_price"] = entry_price
@@ -210,11 +217,13 @@ def run_market(m):
                         if s["step"] >= len(stake_levels):
                             s["in_trade"] = False
 
-                s["last_round_price"] = price
-                last_cycle = current_cycle
+                # RESET FOR NEXT ROUND
+                s["start_price"] = price
+                last_round_end = end
+
                 save_state()
 
-            s["last_update"] = datetime.now().strftime("%H:%M:%S")
+            s["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
 
         except Exception as e:
             print("ERROR:", e)
@@ -240,22 +249,26 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Outcome Bot (Final)</h1>
+<h1>Hybrid Bot (Stable)</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
 <div style="margin:10px;padding:10px;background:#1e293b">
 <h3>{{m}}</h3>
 
+<p>Round: {{s.round}}</p>
 <p>⏳ {{s.countdown}}</p>
+<p>Start: {{s.start_price}}</p>
+<p>Current: {{s.current_price}}</p>
+
 <p>History: {{s.history}}</p>
 <p>Signal: {{s.signal}}</p>
-<p>Price: {{s.current_price}}</p>
 <p>Last update: {{s.last_update}}</p>
 
 {% if s.in_trade %}
 <p>Trading {{s.trade_direction}} (step {{s.step+1}})</p>
 <p>Bet: ${{s.bet}}</p>
+<p>Entry price: {{s.entry_price}}</p>
 <p>Expected profit: ${{s.expected_profit}}</p>
 {% else %}
 <p>Idle</p>
