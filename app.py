@@ -32,42 +32,94 @@ def fetch_markets():
     return None
 
 # =========================
-# GET MARKET INFO (price + end time)
+# FIND BEST MARKET (LOCKING)
 # =========================
-def get_market_info(asset):
+def find_best_market(asset):
     data = fetch_markets()
     if not data:
-        return None, None
+        return None
 
-    try:
-        for m in data:
+    asset_map = {
+        "bitcoin": ["bitcoin", "btc"],
+        "ethereum": ["ethereum", "eth"],
+        "ripple": ["ripple", "xrp"],
+        "solana": ["solana", "sol"]
+    }
+
+    keywords = asset_map.get(asset, [asset])
+
+    best_market = None
+    best_time_diff = float("inf")
+    now = datetime.now(timezone.utc)
+
+    for m in data:
+        try:
             title = m.get("question", "").lower()
 
-            if asset in title and "higher" in title and m.get("active", True):
-                outcomes = m.get("outcomes", [])
-                if outcomes and "price" in outcomes[0]:
+            if not any(k in title for k in keywords):
+                continue
 
-                    price = float(outcomes[0]["price"])
-                    end_time = m.get("endDate")
+            if not m.get("active", True):
+                continue
 
-                    if 0 < price < 1:
-                        return price, end_time
+            end_time = m.get("endDate")
+            if not end_time:
+                continue
 
-        return None, None
+            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            diff = (end - now).total_seconds()
+
+            if diff <= 0:
+                continue
+
+            if diff < best_time_diff:
+                best_time_diff = diff
+                best_market = m
+
+        except:
+            continue
+
+    return best_market
+
+# =========================
+# GET MARKET INFO
+# =========================
+def get_market_info(asset, locked_market):
+    # use locked market if valid
+    if locked_market:
+        try:
+            outcomes = locked_market.get("outcomes", [])
+            price = float(outcomes[0]["price"])
+            end_time = locked_market.get("endDate")
+
+            if 0 < price < 1:
+                return price, end_time, locked_market
+        except:
+            pass
+
+    # otherwise find new one
+    new_market = find_best_market(asset)
+    if not new_market:
+        return None, None, None
+
+    try:
+        price = float(new_market["outcomes"][0]["price"])
+        end_time = new_market.get("endDate")
+        return price, end_time, new_market
     except:
-        return None, None
+        return None, None, None
 
 # =========================
-# SAFE PRICE FETCH
+# SAFE FETCH
 # =========================
-def safe_get_info(asset, last_price):
+def safe_get_info(asset, last_price, locked_market):
     for _ in range(3):
-        price, end_time = get_market_info(asset)
+        price, end_time, market = get_market_info(asset, locked_market)
         if price is not None:
-            return price, end_time
+            return price, end_time, market
         time.sleep(2)
 
-    return last_price, None
+    return last_price, None, locked_market
 
 # =========================
 # COUNTDOWN
@@ -131,7 +183,8 @@ for m in markets:
         "expected_profit": 0,
         "last_price": None,
         "last_update": "Starting...",
-        "countdown": "--:--"
+        "countdown": "--:--",
+        "market": None
     }
 
 loaded = load_state()
@@ -148,9 +201,10 @@ def run_market(m):
 
     while True:
         try:
-            time.sleep(60)  # check every minute (better timing)
+            time.sleep(60)
 
-            price, end_time = safe_get_info(m, s["last_price"])
+            price, end_time, market = safe_get_info(m, s["last_price"], s["market"])
+            s["market"] = market
 
             if price is None:
                 s["last_update"] = "No data"
@@ -164,7 +218,7 @@ def run_market(m):
 
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
-            # STREAK
+            # STREAK LOGIC (UNCHANGED)
             if price > s["last_price"]:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
@@ -174,7 +228,7 @@ def run_market(m):
 
             s["last_price"] = price
 
-            # ENTRY
+            # ENTRY (UNCHANGED)
             if not s["in_trade"]:
                 if s["up_streak"] >= 3:
                     s["in_trade"] = True
@@ -186,7 +240,7 @@ def run_market(m):
                     s["trade_direction"] = "UP"
                     s["step"] = 0
 
-            # TRADE LOOP
+            # TRADE LOOP (UNCHANGED)
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
                 entry_price = s["last_price"]
@@ -197,7 +251,7 @@ def run_market(m):
 
                 time.sleep(300)
 
-                new_price, _ = safe_get_info(m, entry_price)
+                new_price, _, _ = safe_get_info(m, entry_price, s["market"])
 
                 if new_price is None:
                     continue
