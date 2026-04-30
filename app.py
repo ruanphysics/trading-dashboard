@@ -1,10 +1,10 @@
-import requests
 import time
 import threading
-import re
 from datetime import datetime
 import pytz
+import requests
 from flask import Flask, jsonify, render_template_string
+from playwright.sync_api import sync_playwright
 
 # =========================
 # SETTINGS
@@ -28,6 +28,23 @@ ET = pytz.timezone("America/New_York")
 START_TIME = time.time()
 
 # =========================
+# PLAYWRIGHT (CLOUD SAFE)
+# =========================
+playwright = sync_playwright().start()
+
+browser = playwright.chromium.launch(
+    headless=True,
+    args=[
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu"
+    ]
+)
+
+page = browser.new_page()
+
+# =========================
 # TIME
 # =========================
 def get_round_info():
@@ -41,7 +58,7 @@ def get_uptime():
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 # =========================
-# PRICE
+# COINBASE PRICE
 # =========================
 def get_price(symbol):
     try:
@@ -54,23 +71,27 @@ def get_price(symbol):
         return None
 
 # =========================
-# 🔥 EXTRACT POLYMARKET PAGE DATA
+# 🔥 SAFE SCRAPER
 # =========================
 def get_poly_prices(url):
     try:
-        html = requests.get(url, timeout=5).text
+        page.goto(url, timeout=15000)
 
-        # find probability values (they appear as decimals like 0.62)
-        matches = re.findall(r'"price":\s*([0-9.]+)', html)
+        # wait for JS to load
+        page.wait_for_timeout(2500)
+
+        content = page.content()
+
+        import re
+        matches = re.findall(r'([0]\.[0-9]{2})', content)
 
         if len(matches) >= 2:
-            yes = float(matches[0])
-            no = float(matches[1])
-            return yes, no
+            return float(matches[0]), float(matches[1])
 
         return None, None
 
-    except:
+    except Exception as e:
+        print("SCRAPE ERROR:", e)
         return None, None
 
 def get_poly_signal(yes, no):
@@ -81,8 +102,7 @@ def get_poly_signal(yes, no):
         return "UP"
     elif no > 0.55:
         return "DOWN"
-    else:
-        return None
+    return None
 
 # =========================
 # STATE
@@ -108,7 +128,7 @@ def run_market(m):
     last_round = None
 
     while True:
-        time.sleep(4)
+        time.sleep(6)
 
         end, countdown = get_round_info()
 
@@ -122,7 +142,6 @@ def run_market(m):
 
         s["price"] = price
 
-        # 🔥 real polymarket extraction
         yes, no = get_poly_prices(markets[m])
         s["yes"] = yes
         s["no"] = no
@@ -140,7 +159,6 @@ def run_market(m):
             if len(s["history"]) > 7:
                 s["history"].pop(0)
 
-            # pattern logic
             if len(s["history"]) >= 3:
                 last3 = s["history"][-3:]
                 if last3 == ["UP","UP","UP"]:
@@ -150,7 +168,6 @@ def run_market(m):
                 else:
                     s["pattern"] = None
 
-            # bet decision
             if s["pattern"] and s["pattern"] == s["poly"]:
                 s["bet"] = s["pattern"]
             else:
@@ -205,7 +222,7 @@ async function load(){
   document.getElementById(m+"_bet").innerText=s.bet;
  }
 }
-setInterval(load,4000);
+setInterval(load,6000);
 </script>
 
 <body style="background:#111;color:white">
@@ -232,5 +249,8 @@ setInterval(load,4000);
 def home():
     return render_template_string(HTML, state=state)
 
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

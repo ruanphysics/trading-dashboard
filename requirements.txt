@@ -1,4 +1,5 @@
 flask
 requests
 pytz
+playwright
 gunicorn
