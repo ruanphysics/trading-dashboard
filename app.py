@@ -3,13 +3,19 @@ import time
 import threading
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from flask import Flask, render_template_string
 
 # =========================
 # SETTINGS
 # =========================
-markets = ["bitcoin", "ethereum", "ripple", "solana"]
+markets = {
+    "bitcoin": "BTC-USD",
+    "ethereum": "ETH-USD",
+    "ripple": "XRP-USD",
+    "solana": "SOL-USD"
+}
+
 stake_levels = [4, 8, 16]
 STATE_FILE = "state.json"
 
@@ -19,130 +25,59 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# FETCH MARKETS
+# TIMER (5-MIN CYCLE)
 # =========================
-def fetch_markets():
-    try:
-        url = "https://gamma-api.polymarket.com/markets"
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            return res.json()
-    except:
-        pass
-    return None
+def get_countdown():
+    now = datetime.utcnow()
+    seconds = now.minute * 60 + now.second
+    remaining = 300 - (seconds % 300)
+
+    mins = remaining // 60
+    secs = remaining % 60
+
+    return f"{mins:02d}:{secs:02d}"
 
 # =========================
-# FIND BEST MARKET (LOCKING)
+# COINBASE PRICE
 # =========================
-def find_best_market(asset):
-    data = fetch_markets()
-    if not data:
+def get_coinbase_price(pair):
+    try:
+        url = f"https://api.exchange.coinbase.com/products/{pair}/ticker"
+        res = requests.get(url, timeout=10).json()
+        return float(res["price"])
+    except:
         return None
 
-    asset_map = {
-        "bitcoin": ["bitcoin", "btc"],
-        "ethereum": ["ethereum", "eth"],
-        "ripple": ["ripple", "xrp"],
-        "solana": ["solana", "sol"]
-    }
+# =========================
+# POLYMARKET PRICE
+# =========================
+def get_polymarket_price(asset):
+    try:
+        url = "https://gamma-api.polymarket.com/markets"
+        res = requests.get(url, timeout=10).json()
 
-    keywords = asset_map.get(asset, [asset])
+        asset_map = {
+            "bitcoin": ["bitcoin", "btc"],
+            "ethereum": ["ethereum", "eth"],
+            "ripple": ["ripple", "xrp"],
+            "solana": ["solana", "sol"]
+        }
 
-    best_market = None
-    best_time_diff = float("inf")
-    now = datetime.now(timezone.utc)
+        keywords = asset_map[asset]
 
-    for m in data:
-        try:
+        for m in res:
             title = m.get("question", "").lower()
 
-            if not any(k in title for k in keywords):
-                continue
+            if any(k in title for k in keywords) and m.get("active", True):
+                outcomes = m.get("outcomes", [])
+                if outcomes:
+                    price = float(outcomes[0]["price"])
+                    if 0 < price < 1:
+                        return price
 
-            if not m.get("active", True):
-                continue
-
-            end_time = m.get("endDate")
-            if not end_time:
-                continue
-
-            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-            diff = (end - now).total_seconds()
-
-            if diff <= 0:
-                continue
-
-            if diff < best_time_diff:
-                best_time_diff = diff
-                best_market = m
-
-        except:
-            continue
-
-    return best_market
-
-# =========================
-# GET MARKET INFO
-# =========================
-def get_market_info(asset, locked_market):
-    # use locked market if valid
-    if locked_market:
-        try:
-            outcomes = locked_market.get("outcomes", [])
-            price = float(outcomes[0]["price"])
-            end_time = locked_market.get("endDate")
-
-            if 0 < price < 1:
-                return price, end_time, locked_market
-        except:
-            pass
-
-    # otherwise find new one
-    new_market = find_best_market(asset)
-    if not new_market:
-        return None, None, None
-
-    try:
-        price = float(new_market["outcomes"][0]["price"])
-        end_time = new_market.get("endDate")
-        return price, end_time, new_market
+        return None
     except:
-        return None, None, None
-
-# =========================
-# SAFE FETCH
-# =========================
-def safe_get_info(asset, last_price, locked_market):
-    for _ in range(3):
-        price, end_time, market = get_market_info(asset, locked_market)
-        if price is not None:
-            return price, end_time, market
-        time.sleep(2)
-
-    return last_price, None, locked_market
-
-# =========================
-# COUNTDOWN
-# =========================
-def get_time_remaining(end_time):
-    try:
-        if not end_time:
-            return "--:--"
-
-        end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-
-        diff = (end - now).total_seconds()
-
-        if diff <= 0:
-            return "00:00"
-
-        mins = int(diff // 60)
-        secs = int(diff % 60)
-
-        return f"{mins:02d}:{secs:02d}"
-    except:
-        return "--:--"
+        return None
 
 # =========================
 # SAVE / LOAD
@@ -183,8 +118,8 @@ for m in markets:
         "expected_profit": 0,
         "last_price": None,
         "last_update": "Starting...",
-        "countdown": "--:--",
-        "market": None
+        "poly_price": None,
+        "countdown": "--:--"
     }
 
 loaded = load_state()
@@ -193,7 +128,7 @@ state = loaded if loaded else default_state
 # =========================
 # BOT
 # =========================
-def run_market(m):
+def run_market(m, pair):
     global bankroll
     s = state[m]
 
@@ -203,14 +138,15 @@ def run_market(m):
         try:
             time.sleep(60)
 
-            price, end_time, market = safe_get_info(m, s["last_price"], s["market"])
-            s["market"] = market
+            price = get_coinbase_price(pair)
+            poly_price = get_polymarket_price(m)
 
-            if price is None:
+            if price is None or poly_price is None:
                 s["last_update"] = "No data"
                 continue
 
-            s["countdown"] = get_time_remaining(end_time)
+            s["poly_price"] = poly_price
+            s["countdown"] = get_countdown()
 
             if s["last_price"] is None:
                 s["last_price"] = price
@@ -218,7 +154,7 @@ def run_market(m):
 
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
-            # STREAK LOGIC (UNCHANGED)
+            # STREAK
             if price > s["last_price"]:
                 s["up_streak"] += 1
                 s["down_streak"] = 0
@@ -228,7 +164,7 @@ def run_market(m):
 
             s["last_price"] = price
 
-            # ENTRY (UNCHANGED)
+            # ENTRY
             if not s["in_trade"]:
                 if s["up_streak"] >= 3:
                     s["in_trade"] = True
@@ -240,10 +176,10 @@ def run_market(m):
                     s["trade_direction"] = "UP"
                     s["step"] = 0
 
-            # TRADE LOOP (UNCHANGED)
+            # TRADE LOOP
             while s["in_trade"] and s["step"] < len(stake_levels):
                 bet = stake_levels[s["step"]]
-                entry_price = s["last_price"]
+                entry_price = s["poly_price"]
 
                 s["current_bet"] = bet
                 s["entry_price"] = entry_price
@@ -251,15 +187,15 @@ def run_market(m):
 
                 time.sleep(300)
 
-                new_price, _, _ = safe_get_info(m, entry_price, s["market"])
+                new_price = get_coinbase_price(pair)
 
                 if new_price is None:
                     continue
 
                 win = False
-                if s["trade_direction"] == "DOWN" and new_price < entry_price:
+                if s["trade_direction"] == "DOWN" and new_price < s["last_price"]:
                     win = True
-                elif s["trade_direction"] == "UP" and new_price > entry_price:
+                elif s["trade_direction"] == "UP" and new_price > s["last_price"]:
                     win = True
 
                 if win:
@@ -292,7 +228,7 @@ def run_market(m):
             print("THREAD ERROR:", e)
 
 # =========================
-# START BOTS
+# START
 # =========================
 bots_started = False
 
@@ -301,8 +237,8 @@ def start_once():
     global bots_started
     if not bots_started:
         print("🔥 STARTING BOTS...")
-        for m in markets:
-            threading.Thread(target=run_market, args=(m,), daemon=True).start()
+        for m, pair in markets.items():
+            threading.Thread(target=run_market, args=(m, pair), daemon=True).start()
         bots_started = True
 
 # =========================
@@ -313,7 +249,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Polymarket Bot</h1>
+<h1>Hybrid Bot</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
@@ -322,7 +258,8 @@ HTML = """
 
 <p>⏳ {{s.countdown}}</p>
 <p>U:{{s.up_streak}} D:{{s.down_streak}}</p>
-<p>Last price: {{s.last_price}}</p>
+<p>Coinbase: {{s.last_price}}</p>
+<p>Polymarket: {{s.poly_price}}</p>
 <p>Last update: {{s.last_update}}</p>
 
 {% if s.in_trade %}
@@ -349,8 +286,5 @@ def dashboard():
         bankroll=round(bankroll, 2)
     )
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
