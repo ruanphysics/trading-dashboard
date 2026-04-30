@@ -9,13 +9,7 @@ from flask import Flask, render_template_string
 # =========================
 # SETTINGS
 # =========================
-markets = {
-    "bitcoin": "BTC-USD",
-    "ethereum": "ETH-USD",
-    "ripple": "XRP-USD",
-    "solana": "SOL-USD"
-}
-
+markets = ["bitcoin", "ethereum", "ripple", "solana"]
 stake_levels = [4, 8, 16]
 STATE_FILE = "state.json"
 
@@ -25,7 +19,7 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 # =========================
-# TIMER (5-MIN CYCLE)
+# 5-MIN TIMER
 # =========================
 def get_countdown():
     now = datetime.utcnow()
@@ -34,19 +28,7 @@ def get_countdown():
 
     mins = remaining // 60
     secs = remaining % 60
-
-    return f"{mins:02d}:{secs:02d}"
-
-# =========================
-# COINBASE PRICE
-# =========================
-def get_coinbase_price(pair):
-    try:
-        url = f"https://api.exchange.coinbase.com/products/{pair}/ticker"
-        res = requests.get(url, timeout=10).json()
-        return float(res["price"])
-    except:
-        return None
+    return f"{mins:02d}:{secs:02d}", remaining
 
 # =========================
 # POLYMARKET PRICE
@@ -107,19 +89,19 @@ def load_state():
 default_state = {}
 for m in markets:
     default_state[m] = {
-        "up_streak": 0,
-        "down_streak": 0,
+        "history": [],
+        "last_round_price": None,
+        "current_price": None,
+        "signal": None,
         "in_trade": False,
         "trade_direction": None,
         "step": 0,
         "profit": 0,
+        "bet": 0,
         "entry_price": None,
-        "current_bet": 0,
         "expected_profit": 0,
-        "last_price": None,
-        "last_update": "Starting...",
-        "poly_price": None,
-        "countdown": "--:--"
+        "countdown": "--:--",
+        "last_update": "Starting..."
     }
 
 loaded = load_state()
@@ -128,118 +110,125 @@ state = loaded if loaded else default_state
 # =========================
 # BOT
 # =========================
-def run_market(m, pair):
+def run_market(m):
     global bankroll
     s = state[m]
 
-    print(f"STARTED BOT: {m}")
+    print(f"STARTED: {m}")
+
+    last_cycle = None
 
     while True:
         try:
-            time.sleep(60)
+            time.sleep(5)
 
-            price = get_coinbase_price(pair)
-            poly_price = get_polymarket_price(m)
+            countdown, remaining = get_countdown()
+            s["countdown"] = countdown
 
-            if price is None or poly_price is None:
-                s["last_update"] = "No data"
+            price = get_polymarket_price(m)
+
+            if price is None:
+                s["last_update"] = "No Polymarket data"
                 continue
 
-            s["poly_price"] = poly_price
-            s["countdown"] = get_countdown()
+            s["current_price"] = price
 
-            if s["last_price"] is None:
-                s["last_price"] = price
+            current_cycle = int(time.time() // 300)
+
+            # NEW 5-MIN CYCLE DETECTED
+            if last_cycle is None:
+                last_cycle = current_cycle
+                s["last_round_price"] = price
                 continue
+
+            if current_cycle != last_cycle:
+                # DETERMINE OUTCOME
+                if price > s["last_round_price"]:
+                    outcome = "UP"
+                elif price < s["last_round_price"]:
+                    outcome = "DOWN"
+                else:
+                    outcome = "FLAT"
+
+                if outcome != "FLAT":
+                    s["history"].append(outcome)
+                    if len(s["history"]) > 10:
+                        s["history"].pop(0)
+
+                # APPLY STRATEGY
+                if len(s["history"]) >= 3:
+                    last3 = s["history"][-3:]
+
+                    if last3 == ["UP", "UP", "UP"]:
+                        s["signal"] = "DOWN"
+                    elif last3 == ["DOWN", "DOWN", "DOWN"]:
+                        s["signal"] = "UP"
+                    else:
+                        s["signal"] = None
+
+                # PLACE SIMULATED TRADE
+                if s["signal"] and not s["in_trade"]:
+                    s["in_trade"] = True
+                    s["trade_direction"] = s["signal"]
+                    s["step"] = 0
+
+                # EXECUTE TRADE
+                if s["in_trade"]:
+                    bet = stake_levels[s["step"]]
+                    entry_price = price
+
+                    s["bet"] = bet
+                    s["entry_price"] = entry_price
+                    s["expected_profit"] = round(bet * (1 - entry_price), 2)
+
+                    # RESOLVE IMMEDIATELY USING OUTCOME
+                    win = False
+                    if s["trade_direction"] == "UP" and outcome == "UP":
+                        win = True
+                    elif s["trade_direction"] == "DOWN" and outcome == "DOWN":
+                        win = True
+
+                    if win:
+                        profit = bet * (1 - entry_price)
+                        with bankroll_lock:
+                            bankroll += profit
+
+                        s["profit"] += profit
+                        s["in_trade"] = False
+
+                    else:
+                        loss = bet * entry_price
+                        with bankroll_lock:
+                            bankroll -= loss
+
+                        s["profit"] -= loss
+                        s["step"] += 1
+
+                        if s["step"] >= len(stake_levels):
+                            s["in_trade"] = False
+
+                s["last_round_price"] = price
+                last_cycle = current_cycle
+
+                save_state()
 
             s["last_update"] = datetime.now().strftime("%H:%M:%S")
 
-            # STREAK
-            if price > s["last_price"]:
-                s["up_streak"] += 1
-                s["down_streak"] = 0
-            elif price < s["last_price"]:
-                s["down_streak"] += 1
-                s["up_streak"] = 0
-
-            s["last_price"] = price
-
-            # ENTRY
-            if not s["in_trade"]:
-                if s["up_streak"] >= 3:
-                    s["in_trade"] = True
-                    s["trade_direction"] = "DOWN"
-                    s["step"] = 0
-
-                elif s["down_streak"] >= 3:
-                    s["in_trade"] = True
-                    s["trade_direction"] = "UP"
-                    s["step"] = 0
-
-            # TRADE LOOP
-            while s["in_trade"] and s["step"] < len(stake_levels):
-                bet = stake_levels[s["step"]]
-                entry_price = s["poly_price"]
-
-                s["current_bet"] = bet
-                s["entry_price"] = entry_price
-                s["expected_profit"] = round(bet * (1 - entry_price), 2)
-
-                time.sleep(300)
-
-                new_price = get_coinbase_price(pair)
-
-                if new_price is None:
-                    continue
-
-                win = False
-                if s["trade_direction"] == "DOWN" and new_price < s["last_price"]:
-                    win = True
-                elif s["trade_direction"] == "UP" and new_price > s["last_price"]:
-                    win = True
-
-                if win:
-                    profit = bet * (1 - entry_price)
-                    with bankroll_lock:
-                        bankroll += profit
-
-                    s["profit"] += profit
-                    s["in_trade"] = False
-                    s["up_streak"] = 0
-                    s["down_streak"] = 0
-                    break
-
-                else:
-                    loss = bet * entry_price
-                    with bankroll_lock:
-                        bankroll -= loss
-
-                    s["profit"] -= loss
-                    s["step"] += 1
-
-            if s["in_trade"] and s["step"] >= len(stake_levels):
-                s["in_trade"] = False
-                s["up_streak"] = 0
-                s["down_streak"] = 0
-
-            save_state()
-
         except Exception as e:
-            print("THREAD ERROR:", e)
+            print("ERROR:", e)
 
 # =========================
 # START
 # =========================
-bots_started = False
+started = False
 
 @app.before_request
 def start_once():
-    global bots_started
-    if not bots_started:
-        print("🔥 STARTING BOTS...")
-        for m, pair in markets.items():
-            threading.Thread(target=run_market, args=(m, pair), daemon=True).start()
-        bots_started = True
+    global started
+    if not started:
+        for m in markets:
+            threading.Thread(target=run_market, args=(m,), daemon=True).start()
+        started = True
 
 # =========================
 # UI
@@ -249,7 +238,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="5"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot</h1>
+<h1>Outcome Bot</h1>
 <h2>Bank: ${{bankroll}}</h2>
 
 {% for m,s in state.items() %}
@@ -257,14 +246,14 @@ HTML = """
 <h3>{{m}}</h3>
 
 <p>⏳ {{s.countdown}}</p>
-<p>U:{{s.up_streak}} D:{{s.down_streak}}</p>
-<p>Coinbase: {{s.last_price}}</p>
-<p>Polymarket: {{s.poly_price}}</p>
+<p>History: {{s.history}}</p>
+<p>Signal: {{s.signal}}</p>
+<p>Price: {{s.current_price}}</p>
 <p>Last update: {{s.last_update}}</p>
 
 {% if s.in_trade %}
 <p>Trading {{s.trade_direction}} (step {{s.step+1}})</p>
-<p>Bet: ${{s.current_bet}}</p>
+<p>Bet: ${{s.bet}}</p>
 <p>Expected profit: ${{s.expected_profit}}</p>
 {% else %}
 <p>Idle</p>
@@ -280,11 +269,7 @@ HTML = """
 
 @app.route("/")
 def dashboard():
-    return render_template_string(
-        HTML,
-        state=state,
-        bankroll=round(bankroll, 2)
-    )
+    return render_template_string(HTML, state=state, bankroll=round(bankroll, 2))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
