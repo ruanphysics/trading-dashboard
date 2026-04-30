@@ -27,9 +27,10 @@ bankroll_lock = threading.Lock()
 app = Flask(__name__)
 
 ET = pytz.timezone("America/New_York")
+START_TIME = time.time()  # 🔥 uptime tracker
 
 # =========================
-# TIME (ET ALIGNED)
+# TIME
 # =========================
 def get_et_timestamp():
     return int(datetime.now(ET).timestamp())
@@ -44,8 +45,15 @@ def get_countdown_seconds():
     now = get_et_timestamp()
     return 300 - (now % 300)
 
+def get_uptime():
+    seconds = int(time.time() - START_TIME)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 # =========================
-# COINBASE PRICE
+# PRICE
 # =========================
 def get_coinbase_price(symbol):
     try:
@@ -55,9 +63,6 @@ def get_coinbase_price(symbol):
     except:
         return None
 
-# =========================
-# SIMPLE POLY PRICE (fallback = 0.5)
-# =========================
 def get_poly_price():
     try:
         url = "https://gamma-api.polymarket.com/events"
@@ -118,6 +123,7 @@ for m in markets:
         "entry_price": None,
         "expected_profit": 0,
         "round": "",
+        "countdown": 0,
         "last_update": "Starting..."
     }
 
@@ -138,12 +144,16 @@ def run_market(m):
             time.sleep(3)
 
             start, end = get_round_times()
-            s["round"] = f"{datetime.fromtimestamp(start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(end, ET).strftime('%H:%M')}"
+
+            next_start = end
+            next_end = end + 300
+
+            s["round"] = f"{datetime.fromtimestamp(next_start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(next_end, ET).strftime('%H:%M')}"
+            s["countdown"] = get_countdown_seconds()
 
             price = get_coinbase_price(symbols[m])
 
             if price is None:
-                s["last_update"] = "No price"
                 continue
 
             s["current_price"] = price
@@ -168,7 +178,6 @@ def run_market(m):
                     if len(s["history"]) > 10:
                         s["history"].pop(0)
 
-                # STRATEGY
                 if len(s["history"]) >= 3:
                     last3 = s["history"][-3:]
                     if last3 == ["UP","UP","UP"]:
@@ -178,13 +187,11 @@ def run_market(m):
                     else:
                         s["signal"] = None
 
-                # ENTER TRADE
                 if s["signal"] and not s["in_trade"]:
                     s["in_trade"] = True
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
 
-                # EXECUTE
                 if s["in_trade"]:
                     bet = stake_levels[s["step"]]
                     entry_price = get_poly_price()
@@ -224,7 +231,7 @@ def run_market(m):
             print("ERROR:", e)
 
 # =========================
-# START THREADS
+# START
 # =========================
 started = False
 
@@ -237,77 +244,86 @@ def start_once():
         started = True
 
 # =========================
-# API ENDPOINT
+# API
 # =========================
 @app.route("/data")
 def data():
     return jsonify({
         "state": state,
         "bankroll": round(bankroll, 2),
-        "countdown": get_countdown_seconds()
+        "uptime": get_uptime()
     })
 
 # =========================
-# UI (SMOOTH)
+# UI
 # =========================
 HTML = """
 <html>
 <head>
 <script>
+function formatHistory(arr){
+    return arr.map(x => {
+        if(x === "UP") return '<span style="color:#22c55e">UP</span>';
+        if(x === "DOWN") return '<span style="color:#ef4444">DOWN</span>';
+        return x;
+    }).join(", ");
+}
+
 async function fetchData() {
     const res = await fetch('/data');
     const data = await res.json();
 
     document.getElementById("bank").innerText = data.bankroll;
+    document.getElementById("uptime").innerText = data.uptime;
 
     for (const [m, s] of Object.entries(data.state)) {
         document.getElementById(m+"_price").innerText = s.current_price ?? "-";
         document.getElementById(m+"_signal").innerText = s.signal ?? "-";
-        document.getElementById(m+"_history").innerText = s.history.join(",");
+        document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
         document.getElementById(m+"_round").innerText = s.round;
-        document.getElementById(m+"_update").innerText = s.last_update;
+        document.getElementById(m+"_profit").innerText = s.profit.toFixed(2);
+
+        let sec = s.countdown;
+        let min = String(Math.floor(sec/60)).padStart(2,'0');
+        let s2 = String(sec%60).padStart(2,'0');
+        document.getElementById(m+"_timer").innerText = min + ":" + s2;
+
+        if(s.in_trade){
+            document.getElementById(m+"_trade").innerText =
+                s.trade_direction + " | $" + s.bet + " | step " + (s.step+1);
+        } else {
+            document.getElementById(m+"_trade").innerText = "None";
+        }
     }
 }
 
-function countdownTick() {
-    let el = document.getElementById("timer");
-    let val = parseInt(el.dataset.seconds);
-    val = (val - 1 + 300) % 300;
-    el.dataset.seconds = val;
-    let m = String(Math.floor(val/60)).padStart(2,'0');
-    let s = String(val%60).padStart(2,'0');
-    el.innerText = m + ":" + s;
-}
-
-async function init() {
-    const res = await fetch('/data');
-    const data = await res.json();
-    document.getElementById("timer").dataset.seconds = data.countdown;
-
-    setInterval(fetchData, 3000);
-    setInterval(countdownTick, 1000);
-}
-
-window.onload = init;
+setInterval(fetchData, 3000);
 </script>
 </head>
 
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Smooth)</h1>
+<h1>Hybrid Bot (Advanced)</h1>
 <h2>Bank: $<span id="bank">...</span></h2>
 
-<h2>⏳ <span id="timer" data-seconds="0">--:--</span></h2>
+<div style="position:fixed;top:10px;right:20px;color:#94a3b8">
+Uptime: <span id="uptime">00:00:00</span>
+</div>
 
 {% for m in state %}
 <div style="margin:10px;padding:10px;background:#1e293b">
 <h3>{{m}}</h3>
 
 <p>Round: <span id="{{m}}_round">-</span></p>
+<p>⏳ <span id="{{m}}_timer">--:--</span></p>
 <p>Price: <span id="{{m}}_price">-</span></p>
+
 <p>Signal: <span id="{{m}}_signal">-</span></p>
 <p>History: <span id="{{m}}_history">-</span></p>
-<p>Last update: <span id="{{m}}_update">-</span></p>
+
+<p>Active Bet: <span id="{{m}}_trade">None</span></p>
+
+<p>Profit: $<span id="{{m}}_profit">0</span></p>
 
 </div>
 {% endfor %}
