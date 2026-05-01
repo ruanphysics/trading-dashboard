@@ -98,7 +98,6 @@ for m in markets:
         "profit": 0,
         "bet": 0,
         "pending": False,
-        "just_entered": False,
         "waiting_for_pattern": False,
         "last_processed_end": None,
         "round": "",
@@ -151,7 +150,6 @@ def run_market(m):
                 s["start_price"] = price
                 continue
 
-            # round guard
             if s["last_processed_end"] == end:
                 continue
 
@@ -159,7 +157,7 @@ def run_market(m):
                 s["last_processed_end"] = end
                 s["pending"] = False
 
-                # outcome
+                # OUTCOME
                 if price > s["start_price"]:
                     outcome = "UP"
                 elif price < s["start_price"]:
@@ -172,25 +170,60 @@ def run_market(m):
                     if len(s["history"]) > 7:
                         s["history"].pop(0)
 
-                # streak logic
+                # STREAK
                 streak_dir, streak_count = get_streak(s["history"])
 
-                # signal
+                # SIGNAL
                 if streak_count >= 3:
                     s["signal"] = "DOWN" if streak_dir == "UP" else "UP"
                 else:
                     s["signal"] = None
 
-                # 🔥 STOP TRADE if streak breaks
+                # UNLOCK waiting on new pattern
+                if s["waiting_for_pattern"] and s["signal"]:
+                    s["waiting_for_pattern"] = False
+
+                # =========================
+                # EXECUTE (NO DELAY)
+                # =========================
                 if s["in_trade"]:
-                    if (
-                        (s["trade_direction"] == "UP" and streak_dir != "DOWN") or
-                        (s["trade_direction"] == "DOWN" and streak_dir != "UP")
-                    ):
+                    prev_bet = stake_levels[s["step"]]
+
+                    win = (
+                        (s["trade_direction"] == "UP" and outcome == "UP") or
+                        (s["trade_direction"] == "DOWN" and outcome == "DOWN")
+                    )
+
+                    if win:
+                        profit = prev_bet * 0.75
+                        with bankroll_lock:
+                            bankroll += profit
+                        s["profit"] += profit
+
+                        # RESET + CLEAR HISTORY
                         s["in_trade"] = False
                         s["waiting_for_pattern"] = True
                         s["trade_direction"] = None
                         s["step"] = 0
+                        s["history"] = []
+
+                    else:
+                        loss = prev_bet
+                        with bankroll_lock:
+                            bankroll -= loss
+                        s["profit"] -= loss
+
+                        s["step"] += 1
+
+                        if s["step"] >= len(stake_levels):
+                            # LOST STEP 3 → RESET + CLEAR HISTORY
+                            s["in_trade"] = False
+                            s["waiting_for_pattern"] = True
+                            s["trade_direction"] = None
+                            s["step"] = 0
+                            s["history"] = []
+                        else:
+                            s["pending"] = True
 
                 # ENTER TRADE
                 if s["signal"] and not s["in_trade"] and not s["waiting_for_pattern"]:
@@ -198,49 +231,11 @@ def run_market(m):
                     s["trade_direction"] = s["signal"]
                     s["step"] = 0
                     s["bet"] = stake_levels[0]
-                    s["just_entered"] = True
                     s["pending"] = True
 
-                # EXECUTE
+                # UPDATE BET
                 if s["in_trade"]:
-                    bet = stake_levels[s["step"]]
-                    s["bet"] = bet
-
-                    if s["just_entered"]:
-                        s["just_entered"] = False
-                    else:
-                        win = (
-                            (s["trade_direction"] == "UP" and outcome == "UP") or
-                            (s["trade_direction"] == "DOWN" and outcome == "DOWN")
-                        )
-
-                        if win:
-                            profit = bet * 0.75
-                            with bankroll_lock:
-                                bankroll += profit
-                            s["profit"] += profit
-
-                            s["in_trade"] = False
-                            s["waiting_for_pattern"] = True
-                            s["trade_direction"] = None
-                            s["step"] = 0
-
-                        else:
-                            loss = bet
-                            with bankroll_lock:
-                                bankroll -= loss
-                            s["profit"] -= loss
-
-                            s["step"] += 1
-
-                            if s["step"] >= len(stake_levels):
-                                s["in_trade"] = False
-                                s["waiting_for_pattern"] = True
-                                s["trade_direction"] = None
-                                s["step"] = 0
-                            else:
-                                s["just_entered"] = True
-                                s["pending"] = True
+                    s["bet"] = stake_levels[s["step"]]
 
                 s["start_price"] = price
                 last_round_end = end
@@ -274,7 +269,7 @@ def data():
     })
 
 # =========================
-# UI
+# UI (UNCHANGED)
 # =========================
 HTML = """
 <html>
@@ -331,7 +326,7 @@ setInterval(fetchData, 2000);
 
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h1>Hybrid Bot (Streak Logic)</h1>
+<h1>Hybrid Bot (Final)</h1>
 <h2>Bank: $<span id="bank">...</span></h2>
 
 <div style="position:fixed;top:10px;right:20px;color:#94a3b8">
