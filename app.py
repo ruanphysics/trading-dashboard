@@ -19,7 +19,6 @@ symbols = {
     "solana": "SOL-USD"
 }
 
-# NEW LADDER
 stake_levels = [4, 8, 20, 44, 100]
 
 STATE_FILE = "state.json"
@@ -177,7 +176,7 @@ def run_market(m):
                 # STREAK
                 streak_dir, streak_count = get_streak(s["history"])
 
-                # UPDATE MAX STREAK
+                # UPDATE MAX STREAK (PERSISTENT)
                 if streak_count > s["max_streak"]:
                     s["max_streak"] = streak_count
 
@@ -191,9 +190,7 @@ def run_market(m):
                 if s["waiting_for_pattern"] and s["signal"]:
                     s["waiting_for_pattern"] = False
 
-                # =========================
                 # EXECUTE
-                # =========================
                 if s["in_trade"]:
                     prev_bet = stake_levels[s["step"]]
 
@@ -208,7 +205,7 @@ def run_market(m):
                             bankroll += profit
                         s["profit"] += profit
 
-                        # RESET
+                        # RESET (NO max_streak reset)
                         s["in_trade"] = False
                         s["waiting_for_pattern"] = True
                         s["trade_direction"] = None
@@ -217,7 +214,6 @@ def run_market(m):
                         s["history"] = []
                         s["signal"] = None
                         s["pending"] = False
-                        s["max_streak"] = 0
 
                     else:
                         loss = prev_bet
@@ -228,7 +224,7 @@ def run_market(m):
                         s["step"] += 1
 
                         if s["step"] >= len(stake_levels):
-                            # FINAL LOSS RESET
+                            # FINAL LOSS RESET (NO max_streak reset)
                             s["in_trade"] = False
                             s["waiting_for_pattern"] = True
                             s["trade_direction"] = None
@@ -237,7 +233,6 @@ def run_market(m):
                             s["history"] = []
                             s["signal"] = None
                             s["pending"] = False
-                            s["max_streak"] = 0
                         else:
                             s["pending"] = True
 
@@ -310,7 +305,6 @@ async function fetchData() {
         document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
         document.getElementById(m+"_signal").innerText = s.signal ?? "-";
         document.getElementById(m+"_round").innerText = s.round;
-
         document.getElementById(m+"_streak").innerText = s.max_streak ?? 0;
 
         let sec = s.countdown;
