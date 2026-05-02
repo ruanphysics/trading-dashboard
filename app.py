@@ -26,7 +26,7 @@ app = Flask(__name__)
 TEMPLATE = """
 <meta http-equiv="refresh" content="5">
 
-<h1>📊 Polymarket 5m Bot (LIVE)</h1>
+<h1>📊 Polymarket 5m Bot (FINAL FIX)</h1>
 
 <p><b>Bankroll:</b> {{bankroll}}</p>
 
@@ -75,30 +75,49 @@ def home():
     return render_template_string(TEMPLATE, bankroll=bankroll, assets=display)
 
 # =========================
-# API HELPERS
+# 🔥 FIXED MARKET FETCH (PAGINATION)
 # =========================
 def get_live_markets():
     try:
-        data = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"limit": 200}
-        ).json()
-
         found = {}
 
-        for m in data:
-            slug = m.get("slug", "").lower()
+        offset = 0
 
-            for asset in ASSETS:
-                if f"{asset}-updown-5m" in slug:
-                    found[asset] = m
+        while offset < 2000:  # scan up to 2000 markets
+            data = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "limit": 200,
+                    "offset": offset,
+                    "active": "true"
+                }
+            ).json()
+
+            if not data:
+                break
+
+            for m in data:
+                slug = m.get("slug", "").lower()
+
+                for asset in ASSETS:
+                    if f"{asset}-updown-5m" in slug:
+                        found[asset] = m
+
+            # stop early if all found
+            if len(found) == len(ASSETS):
+                return found
+
+            offset += 200
 
         return found
 
     except Exception as e:
-        print("MARKET FETCH ERROR:", e)
+        print("MARKET ERROR:", e)
         return {}
 
+# =========================
+# PRICE
+# =========================
 def get_price(token):
     try:
         data = requests.get(f"https://clob.polymarket.com/books/{token}").json()
@@ -120,6 +139,9 @@ def get_price(token):
 
     return None
 
+# =========================
+# RESULT
+# =========================
 def get_result(mid):
     try:
         data = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}").json()
@@ -139,7 +161,6 @@ def get_result(mid):
 def run_bot():
     global asset_states
 
-    # INIT
     for a in ASSETS:
         asset_states[a] = {
             "name": a.upper(),
@@ -154,6 +175,8 @@ def run_bot():
     while True:
         try:
             markets = get_live_markets()
+
+            print("Markets found:", list(markets.keys()))
 
             for a in ASSETS:
                 s = asset_states[a]
@@ -184,14 +207,10 @@ def run_bot():
                     s["status"] = "NO TOKENS"
                     continue
 
-                # PRICE
                 price = get_price(tokens["UP"])
                 s["price"] = price
 
-                if not price:
-                    s["status"] = "NO PRICE"
-                else:
-                    s["status"] = "LIVE"
+                s["status"] = "LIVE" if price else "NO PRICE"
 
                 # RESULT
                 result = get_result(mid)
