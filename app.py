@@ -17,15 +17,15 @@ MAX_BET = 5.0
 MAX_STEPS = 10
 
 ROUND_SECONDS = 300
-SLEEP_TIME = 10
+SLEEP_TIME = 5
 
 ET = pytz.timezone("US/Eastern")
 
 # =========================
-# STATE
+# STATE (PER ASSET NOW)
 # =========================
 bankroll = 100.0
-market_states = {}
+asset_states = {}
 bot_started = False
 
 # =========================
@@ -34,30 +34,30 @@ bot_started = False
 app = Flask(__name__)
 
 TEMPLATE = """
-<h1>📊 5-Min Market Bot (Live Simulation)</h1>
+<h1>📊 5-Min Strategy (Clean)</h1>
 
 <p><b>Bankroll:</b> {{bankroll}}</p>
 
-{% for m in markets %}
+{% for a in assets %}
 <div style="border:1px solid #ccc; padding:10px; margin:10px;">
-<b>{{m['name']}}</b><br>
+<b>{{a['name']}}</b><br>
 
-Market ID: {{m['id']}}<br>
-Price: {{m['price']}}<br>
-Status: {{m['status']}}<br>
-Bet: {{m['bet']}}<br>
-Profit: {{m['profit']}}<br>
-Step: {{m['step']}}<br>
-Loss: {{m['loss']}}<br>
+Market ID: {{a['market_id']}}<br>
+Price: {{a['price']}}<br>
+Status: {{a['status']}}<br>
+Bet: {{a['bet']}}<br>
+Profit: {{a['profit']}}<br>
+Step: {{a['step']}}<br>
+Loss: {{a['loss']}}<br>
 
 <br>
 <b>⏱ Time (ET)</b><br>
-Now: {{m['et_time']}}<br>
-Ends In: {{m['timer']}}<br>
+Now: {{a['time']}}<br>
+Ends In: {{a['timer']}}<br>
 
 <br>
-<b>History:</b> {{m['history']}}<br>
-<b>Price Trend:</b> {{m['prices']}}
+<b>History:</b> {{a['history']}}<br>
+<b>Prices:</b> {{a['prices']}}
 </div>
 {% endfor %}
 """
@@ -66,7 +66,6 @@ Ends In: {{m['timer']}}<br>
 def start_bot():
     global bot_started
     if not bot_started:
-        print("🚀 BOT STARTING")
         threading.Thread(target=run_bot, daemon=True).start()
         bot_started = True
 
@@ -74,63 +73,57 @@ def start_bot():
 def home():
     display = []
 
-    for s in market_states.values():
-        status = "Waiting for pattern" if not s["active"] else f"Betting {s['side']}"
-        et_now, timer = get_timer()
+    for s in asset_states.values():
+        now, timer = get_timer()
 
         display.append({
             "name": s["name"],
-            "id": s["id"],
+            "market_id": s["market_id"],
             "price": round(s.get("price", 0), 3),
-            "status": status,
+            "status": "Waiting for pattern" if not s["active"] else f"Betting {s['side']}",
             "bet": round(s.get("bet", 0), 2),
             "profit": round(s.get("profit", 0), 2),
-            "step": s.get("step", 1),
-            "loss": round(s.get("loss", 0), 2),
-            "history": s.get("history", []),
-            "prices": [round(p, 3) for p in s.get("prices", [])],
-            "et_time": et_now,
+            "step": s["step"],
+            "loss": round(s["loss"], 2),
+            "history": s["history"],
+            "prices": [round(p, 3) for p in s["prices"]],
+            "time": now,
             "timer": timer
         })
 
-    return render_template_string(TEMPLATE, bankroll=round(bankroll, 2), markets=display)
+    return render_template_string(TEMPLATE, bankroll=round(bankroll, 2), assets=display)
 
 # =========================
 # TIME
 # =========================
 def get_timer():
     now = datetime.now(ET)
-    rounded = now - timedelta(seconds=now.second % 300, microseconds=now.microsecond)
+    rounded = now - timedelta(seconds=now.second % 300)
     next_round = rounded + timedelta(minutes=5)
 
     remaining = int((next_round - now).total_seconds())
     return now.strftime("%H:%M:%S"), f"{remaining//60:02d}:{remaining%60:02d}"
 
-def generate_market_ids():
+def current_timestamp():
     now = int(time.time())
-    base = now - (now % ROUND_SECONDS)
-
-    ids = []
-    for offset in [0, -300]:  # current + previous
-        ts = base + offset
-        for a in ASSETS:
-            ids.append((a.upper(), f"{a}-updown-5m-{ts}"))
-
-    return ids
+    return now - (now % ROUND_SECONDS)
 
 # =========================
-# PRICE / RESULT
+# TOKEN / PRICE / RESULT
 # =========================
-def get_tokens(market_id):
+def get_tokens(mid):
     try:
-        data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
+        data = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}").json()
+
         tokens = {}
         for o in data.get("outcomes", []):
-            name = o["name"].lower()
-            if "up" in name or "yes" in name:
-                tokens["UP"] = o["token_id"]
-            elif "down" in name or "no" in name:
-                tokens["DOWN"] = o["token_id"]
+            name = o.get("name", "").lower()
+
+            if name in ["yes", "up"]:
+                tokens["UP"] = o.get("token_id")
+            elif name in ["no", "down"]:
+                tokens["DOWN"] = o.get("token_id")
+
         return tokens
     except:
         return {}
@@ -145,12 +138,12 @@ def get_price(token):
         pass
     return None
 
-def get_result(market_id):
+def get_result(mid):
     try:
-        data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
+        data = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}").json()
         for o in data.get("outcomes", []):
             if o.get("winner"):
-                return "UP" if "up" in o["name"].lower() else "DOWN"
+                return "UP" if "yes" in o["name"].lower() else "DOWN"
     except:
         pass
     return None
@@ -172,11 +165,11 @@ def detect_streak(prices):
 
     return None
 
-def calc_bet(price, state):
+def calc_bet(price, s):
     if not price or price <= 0 or price >= 1:
         return BASE_BET
 
-    required = state["loss"] + TARGET_PROFIT
+    required = s["loss"] + TARGET_PROFIT
     raw = required * (price / (1 - price))
 
     return max(min(raw, MAX_BET), BASE_BET)
@@ -187,30 +180,35 @@ def calc_bet(price, state):
 def run_bot():
     global bankroll
 
+    # init states
+    for a in ASSETS:
+        asset_states[a] = {
+            "name": a.upper(),
+            "market_id": "",
+            "prices": [],
+            "history": [],
+            "loss": 0,
+            "step": 1,
+            "active": False,
+            "side": None,
+            "bet": 0,
+            "profit": 0,
+            "last_trade": 0,
+            "last_checked_market": None
+        }
+
     while True:
         try:
-            ids = generate_market_ids()
+            ts = current_timestamp()
 
-            for name, mid in ids:
-                if mid not in market_states:
-                    market_states[mid] = {
-                        "name": f"{name} 5m",
-                        "id": mid,
-                        "prices": [],
-                        "history": [],
-                        "loss": 0,
-                        "step": 1,
-                        "active": False,
-                        "side": None,
-                        "bet": 0,
-                        "profit": 0,
-                        "last_trade": 0
-                    }
+            for a in ASSETS:
+                mid = f"{a}-updown-5m-{ts}"
+                s = asset_states[a]
 
-                s = market_states[mid]
+                s["market_id"] = mid
 
                 tokens = get_tokens(mid)
-                if "UP" not in tokens:
+                if "UP" not in tokens or "DOWN" not in tokens:
                     continue
 
                 price = get_price(tokens["UP"])
@@ -220,18 +218,20 @@ def run_bot():
                 s["price"] = price
                 s["prices"].append(price)
 
-                if len(s["prices"]) > 5:
+                if len(s["prices"]) > 6:
                     s["prices"].pop(0)
 
+                # detect streak
                 if not s["active"]:
                     signal = detect_streak(s["prices"])
                     if signal:
-                        print(f"🔥 {name} SIGNAL {signal}")
                         s["active"] = True
                         s["side"] = signal
+                        print(f"🔥 {a.upper()} SIGNAL {signal}")
 
+                # trade once per round
                 if s["active"]:
-                    if time.time() - s["last_trade"] < ROUND_SECONDS:
+                    if s["last_trade"] == ts:
                         continue
 
                     trade_price = get_price(tokens[s["side"]])
@@ -240,28 +240,33 @@ def run_bot():
 
                     bet = calc_bet(trade_price, s)
                     s["bet"] = bet
-                    s["last_trade"] = time.time()
+                    s["last_trade"] = ts
 
                     result = get_result(mid)
                     if not result:
                         continue
 
                     s["history"].append(result)
+                    if len(s["history"]) > 10:
+                        s["history"].pop(0)
 
                     if result == s["side"]:
                         profit = bet * ((1 - trade_price) / trade_price)
                         bankroll += profit
                         s["profit"] += profit
-                        print(f"✅ {name} WIN {profit:.2f}")
 
                         s["loss"] = 0
                         s["step"] = 1
                         s["active"] = False
+
+                        print(f"✅ {a.upper()} WIN {profit:.2f}")
+
                     else:
                         bankroll -= bet
                         s["loss"] += bet
                         s["step"] += 1
-                        print(f"❌ {name} LOSS {bet:.2f}")
+
+                        print(f"❌ {a.upper()} LOSS {bet:.2f}")
 
                         if s["step"] > MAX_STEPS:
                             s["loss"] = 0
