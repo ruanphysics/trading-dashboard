@@ -1,375 +1,261 @@
-import requests
 import time
-import threading
-import json
+import requests
 import os
-from datetime import datetime
-import pytz
-from flask import Flask, jsonify, render_template_string
+import threading
+from flask import Flask
+from py_clob_client.client import ClobClient
 
 # =========================
-# SETTINGS
+# CONFIG
 # =========================
-markets = ["bitcoin", "ethereum", "ripple", "solana"]
+API_URL = "https://clob.polymarket.com"
+GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
-symbols = {
-    "bitcoin": "BTC-USD",
-    "ethereum": "ETH-USD",
-    "ripple": "XRP-USD",
-    "solana": "SOL-USD"
-}
+CHAIN_ID = 137
 
-stake_levels = [4, 8, 20, 44, 100]
+BASE_BET = 1.0
+TARGET_PROFIT = 0.30
+MAX_BET = 5.0
+MAX_STEPS = 10
 
-STATE_FILE = "state.json"
+ROUND_WAIT = 320
+SLEEP_TIME = 10
 
-bankroll = 100
-bankroll_lock = threading.Lock()
+# =========================
+# SIMULATION STATE
+# =========================
+bankroll = 100.0
 
+current_loss = 0.0
+step = 1
+active_trade = False
+current_side = None
+
+price_history = []
+MAX_HISTORY = 5
+
+# =========================
+# CLIENT (READ-ONLY USAGE)
+# =========================
+client = ClobClient(API_URL, chain_id=CHAIN_ID)
+
+# =========================
+# FLASK APP
+# =========================
 app = Flask(__name__)
 
-ET = pytz.timezone("America/New_York")
-START_TIME = time.time()
+@app.route("/")
+def home():
+    return f"Bot running | Bankroll: {bankroll:.2f}"
 
 # =========================
-# TIME
+# MARKET FUNCTIONS
 # =========================
-def get_et_timestamp():
-    return int(datetime.now(ET).timestamp())
+def get_active_markets():
+    return requests.get(GAMMA_URL, params={"active": "true", "limit": 100}).json()
 
-def get_round_times():
-    now = get_et_timestamp()
-    end = now - (now % 300)
-    start = end - 300
-    return start, end
+def find_market(markets):
+    for m in markets:
+        q = m["question"].lower()
+        if "5 min" in q and ("up" in q or "down" in q):
+            return m
+    return None
 
-def get_countdown_seconds():
-    now = get_et_timestamp()
-    return 300 - (now % 300)
-
-def get_uptime():
-    seconds = int(time.time() - START_TIME)
-    return time.strftime("%H:%M:%S", time.gmtime(seconds))
+def extract_tokens(market):
+    tokens = {}
+    for o in market["outcomes"]:
+        name = o["name"].lower()
+        if "up" in name or "yes" in name:
+            tokens["UP"] = o["token_id"]
+        elif "down" in name or "no" in name:
+            tokens["DOWN"] = o["token_id"]
+    return tokens
 
 # =========================
-# PRICE
+# PRICE + STREAK
 # =========================
-def get_coinbase_price(symbol):
-    try:
-        url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
-        res = requests.get(url, timeout=5).json()
-        return float(res["price"])
-    except:
+def get_price(token_id):
+    book = client.get_order_book(token_id)
+    if not book["asks"]:
+        return None
+    return float(book["asks"][0]["price"])
+
+def update_price(price):
+    global price_history
+    price_history.append(price)
+    if len(price_history) > MAX_HISTORY:
+        price_history.pop(0)
+
+def detect_streak():
+    if len(price_history) < 4:
         return None
 
-# =========================
-# SAVE / LOAD
-# =========================
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({"bankroll": bankroll, "state": state}, f)
-    except:
-        pass
+    directions = []
+    for i in range(1, len(price_history)):
+        if price_history[i] > price_history[i - 1]:
+            directions.append("UP")
+        else:
+            directions.append("DOWN")
 
-def load_state():
-    global bankroll
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                bankroll = data.get("bankroll", 100)
-                return data.get("state", {})
-        except:
-            pass
+    last3 = directions[-3:]
+
+    if all(d == "DOWN" for d in last3):
+        return "UP"
+    if all(d == "UP" for d in last3):
+        return "DOWN"
+
     return None
 
 # =========================
-# STATE
+# BET LOGIC
 # =========================
-default_state = {}
-for m in markets:
-    default_state[m] = {
-        "history": [],
-        "start_price": None,
-        "current_price": None,
-        "signal": None,
-        "in_trade": False,
-        "trade_direction": None,
-        "step": 0,
-        "profit": 0,
-        "bet": 0,
-        "pending": False,
-        "waiting_for_pattern": False,
-        "last_processed_end": None,
-        "round": "",
-        "countdown": 0,
-        "max_streak": 0
-    }
+def calculate_bet(price):
+    global current_loss, step
 
-loaded = load_state()
-state = loaded if loaded else default_state
+    if price <= 0 or price >= 1:
+        return BASE_BET
+
+    required = current_loss + TARGET_PROFIT
+    raw = required * (price / (1 - price))
+
+    safety = min(1.0, 0.7 + (step / MAX_STEPS) * 0.3)
+    bet = min(raw * safety, MAX_BET)
+
+    return max(bet, BASE_BET)
 
 # =========================
-# STREAK
+# SIMULATED ORDER
 # =========================
-def get_streak(history):
-    if not history:
-        return None, 0
-    last = history[-1]
-    count = 1
-    for i in range(len(history)-2, -1, -1):
-        if history[i] == last:
-            count += 1
+def place_order(price, bet, side):
+    print(f"🧪 SIM BET {side} | ${bet:.2f} at price {price:.3f}")
+
+# =========================
+# RESULT (REAL DATA)
+# =========================
+def get_result(market_id):
+    data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
+
+    for o in data["outcomes"]:
+        if o.get("winner"):
+            name = o["name"].lower()
+            if "up" in name or "yes" in name:
+                return "UP"
+            else:
+                return "DOWN"
+
+    return None
+
+# =========================
+# PROCESS RESULT
+# =========================
+def process(price, won, bet):
+    global current_loss, step, active_trade, current_side, bankroll
+
+    if won:
+        profit = bet * ((1 - price) / price)
+        net = profit - current_loss
+
+        bankroll += profit
+        print(f"✅ WIN | +{profit:.2f} | Bankroll: {bankroll:.2f}")
+
+        if net >= TARGET_PROFIT:
+            current_loss = 0
+            step = 1
+            active_trade = False
+            current_side = None
+            print("🔄 Reset cycle")
         else:
-            break
-    return last, count
+            current_loss -= profit
+            step = max(1, step - 2)
+
+    else:
+        bankroll -= bet
+        current_loss += bet
+        step += 1
+
+        print(f"❌ LOSS | -{bet:.2f} | Bankroll: {bankroll:.2f} | Step: {step}")
+
+        if step > MAX_STEPS:
+            print("🛑 Max steps reached — reset")
+            current_loss = 0
+            step = 1
+            active_trade = False
+            current_side = None
 
 # =========================
-# BOT
+# MAIN BOT LOOP
 # =========================
-def run_market(m):
-    global bankroll
-    s = state[m]
-    last_round_end = None
+def run_bot():
+    global active_trade, current_side
+
+    print("🚀 Simulation bot started...")
 
     while True:
         try:
-            time.sleep(1)
+            markets = get_active_markets()
+            market = find_market(markets)
 
-            start, end = get_round_times()
+            if not market:
+                time.sleep(5)
+                continue
 
-            s["round"] = f"{datetime.fromtimestamp(start, ET).strftime('%H:%M')} → {datetime.fromtimestamp(end, ET).strftime('%H:%M')}"
-            s["countdown"] = get_countdown_seconds()
+            tokens = extract_tokens(market)
 
-            price = get_coinbase_price(symbols[m])
+            ref_token = tokens.get("UP")
+            price = get_price(ref_token)
+
             if price is None:
                 continue
 
-            s["current_price"] = price
+            update_price(price)
 
-            if last_round_end is None:
-                last_round_end = end
-                s["start_price"] = price
+            print(f"\n📊 Price: {price:.3f} | Step: {step} | Loss: {current_loss:.2f} | Bankroll: {bankroll:.2f}")
+
+            # WAIT MODE
+            if not active_trade:
+                signal = detect_streak()
+
+                if signal:
+                    active_trade = True
+                    current_side = signal
+                    print(f"🔥 Enter cycle: {current_side}")
+                else:
+                    time.sleep(SLEEP_TIME)
+                    continue
+
+            # ACTIVE MODE
+            token_id = tokens[current_side]
+            price = get_price(token_id)
+
+            if price is None:
                 continue
 
-            if s["last_processed_end"] == end:
+            bet = calculate_bet(price)
+
+            place_order(price, bet, current_side)
+
+            # Wait for resolution
+            time.sleep(ROUND_WAIT)
+
+            result = get_result(market["id"])
+
+            if result is None:
+                print("⏳ Waiting for resolution...")
                 continue
 
-            if end > last_round_end:
-                s["last_processed_end"] = end
-                s["pending"] = False
+            won = result == current_side
+            process(price, won, bet)
 
-                # OUTCOME
-                if price > s["start_price"]:
-                    outcome = "UP"
-                elif price < s["start_price"]:
-                    outcome = "DOWN"
-                else:
-                    outcome = "FLAT"
-
-                if outcome != "FLAT":
-                    s["history"].append(outcome)
-                    if len(s["history"]) > 7:
-                        s["history"].pop(0)
-
-                # STREAK
-                streak_dir, streak_count = get_streak(s["history"])
-
-                # UPDATE MAX STREAK (PERSISTENT)
-                if streak_count > s["max_streak"]:
-                    s["max_streak"] = streak_count
-
-                # SIGNAL
-                if streak_count >= 3:
-                    s["signal"] = "DOWN" if streak_dir == "UP" else "UP"
-                else:
-                    s["signal"] = None
-
-                # UNLOCK WAIT
-                if s["waiting_for_pattern"] and s["signal"]:
-                    s["waiting_for_pattern"] = False
-
-                # EXECUTE
-                if s["in_trade"]:
-                    prev_bet = stake_levels[s["step"]]
-
-                    win = (
-                        (s["trade_direction"] == "UP" and outcome == "UP") or
-                        (s["trade_direction"] == "DOWN" and outcome == "DOWN")
-                    )
-
-                    if win:
-                        profit = prev_bet * 0.75
-                        with bankroll_lock:
-                            bankroll += profit
-                        s["profit"] += profit
-
-                        # RESET (NO max_streak reset)
-                        s["in_trade"] = False
-                        s["waiting_for_pattern"] = True
-                        s["trade_direction"] = None
-                        s["step"] = 0
-
-                        s["history"] = []
-                        s["signal"] = None
-                        s["pending"] = False
-
-                    else:
-                        loss = prev_bet
-                        with bankroll_lock:
-                            bankroll -= loss
-                        s["profit"] -= loss
-
-                        s["step"] += 1
-
-                        if s["step"] >= len(stake_levels):
-                            # FINAL LOSS RESET (NO max_streak reset)
-                            s["in_trade"] = False
-                            s["waiting_for_pattern"] = True
-                            s["trade_direction"] = None
-                            s["step"] = 0
-
-                            s["history"] = []
-                            s["signal"] = None
-                            s["pending"] = False
-                        else:
-                            s["pending"] = True
-
-                # ENTER TRADE
-                if s["signal"] and not s["in_trade"] and not s["waiting_for_pattern"]:
-                    s["in_trade"] = True
-                    s["trade_direction"] = s["signal"]
-                    s["step"] = 0
-                    s["bet"] = stake_levels[0]
-                    s["pending"] = True
-
-                # UPDATE BET
-                if s["in_trade"]:
-                    s["bet"] = stake_levels[s["step"]]
-
-                s["start_price"] = price
-                last_round_end = end
-                save_state()
+            time.sleep(SLEEP_TIME)
 
         except Exception as e:
-            print("ERROR:", e)
+            print(f"🔥 Error: {e}")
+            time.sleep(5)
 
 # =========================
-# START
+# START APP
 # =========================
-started = False
-
-@app.before_request
-def start_once():
-    global started
-    if not started:
-        for m in markets:
-            threading.Thread(target=run_market, args=(m,), daemon=True).start()
-        started = True
-
-# =========================
-# API
-# =========================
-@app.route("/data")
-def data():
-    return jsonify({
-        "state": state,
-        "bankroll": round(bankroll, 2),
-        "uptime": get_uptime()
-    })
-
-# =========================
-# UI
-# =========================
-HTML = """
-<html>
-<head>
-<script>
-function formatHistory(arr){
-    return arr.map(x => x === "UP"
-        ? '<span style="color:#22c55e">UP</span>'
-        : '<span style="color:#ef4444">DOWN</span>'
-    ).join(", ");
-}
-
-async function fetchData() {
-    const res = await fetch('/data');
-    const data = await res.json();
-
-    document.getElementById("bank").innerText = data.bankroll;
-    document.getElementById("uptime").innerText = data.uptime;
-
-    for (const [m, s] of Object.entries(data.state)) {
-
-        document.getElementById(m+"_history").innerHTML = formatHistory(s.history);
-        document.getElementById(m+"_signal").innerText = s.signal ?? "-";
-        document.getElementById(m+"_round").innerText = s.round;
-        document.getElementById(m+"_streak").innerText = s.max_streak ?? 0;
-
-        let sec = s.countdown;
-        let min = String(Math.floor(sec/60)).padStart(2,'0');
-        let s2 = String(sec%60).padStart(2,'0');
-        document.getElementById(m+"_timer").innerText = min + ":" + s2;
-
-        if(s.waiting_for_pattern){
-            document.getElementById(m+"_trade").innerText = "Waiting for pattern";
-        }
-        else if(s.in_trade){
-            document.getElementById(m+"_trade").innerText =
-                s.trade_direction + " | $" + s.bet + " | Step " + (s.step+1);
-        } else {
-            document.getElementById(m+"_trade").innerText = "None";
-        }
-
-        if(s.pending){
-            document.getElementById(m+"_profit").innerText =
-                "Pending (internal: $" + s.profit.toFixed(2) + ")";
-        } else {
-            document.getElementById(m+"_profit").innerText =
-                "$" + s.profit.toFixed(2);
-        }
-    }
-}
-
-setInterval(fetchData, 2000);
-</script>
-</head>
-
-<body style="background:#0f172a;color:white;font-family:Arial">
-
-<h1>Hybrid Bot (Final)</h1>
-<h2>Bank: $<span id="bank">...</span></h2>
-
-<div style="position:fixed;top:10px;right:20px;color:#94a3b8">
-Uptime: <span id="uptime">00:00:00</span>
-</div>
-
-{% for m in state %}
-<div style="margin:10px;padding:10px;background:#1e293b">
-<h3>{{m}}</h3>
-
-<p>Round: <span id="{{m}}_round">-</span></p>
-<p>⏳ <span id="{{m}}_timer">--:--</span></p>
-
-<p>Signal: <span id="{{m}}_signal">-</span></p>
-<p>History: <span id="{{m}}_history">-</span></p>
-
-<p>Max Streak: <span id="{{m}}_streak">0</span></p>
-
-<p>Active Bet: <span id="{{m}}_trade">None</span></p>
-<p>Profit: <span id="{{m}}_profit">0</span></p>
-
-</div>
-{% endfor %}
-
-</body>
-</html>
-"""
-
-@app.route("/")
-def dashboard():
-    return render_template_string(HTML, state=state)
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
