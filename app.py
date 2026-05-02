@@ -23,6 +23,9 @@ MAX_MARKETS = 4
 
 ET = pytz.timezone("US/Eastern")
 
+# =========================
+# STATE
+# =========================
 bankroll = 100.0
 market_states = {}
 
@@ -32,9 +35,10 @@ market_states = {}
 app = Flask(__name__)
 
 TEMPLATE = """
-<h1>📊 Multi-Market Simulation</h1>
+<h1>📊 Multi-Market Simulation (DEBUG MODE)</h1>
 
 <p><b>Total Bankroll:</b> {{bankroll}}</p>
+<p><b>Markets Loaded:</b> {{count}}</p>
 
 {% for m in markets %}
 <div style="border:1px solid #ccc; padding:10px; margin:10px;">
@@ -49,8 +53,8 @@ Loss: {{m['loss']}}<br>
 
 <br>
 <b>⏱ Round Info (ET)</b><br>
-Current Time: {{m['et_time']}}<br>
-Round Ends In: {{m['timer']}}<br>
+Time: {{m['et_time']}}<br>
+Ends In: {{m['timer']}}<br>
 
 <br>
 <b>Outcome History:</b> {{m['history']}}<br>
@@ -85,7 +89,8 @@ def home():
     return render_template_string(
         TEMPLATE,
         bankroll=round(bankroll, 2),
-        markets=display
+        markets=display,
+        count=len(display)
     )
 
 # =========================
@@ -107,43 +112,35 @@ def get_round_timer():
     return now.strftime("%H:%M:%S"), f"{mins:02d}:{secs:02d}"
 
 # =========================
-# MARKET FILTER (SMART)
-# =========================
-def find_markets(markets):
-    selected = []
-
-    for m in markets:
-        q = m["question"].lower()
-
-        # SMART FILTER:
-        # - Must mention time window (5 min / 5 minutes)
-        # - Must be crypto (BTC / ETH)
-        # - Avoid weird/long-term markets
-        if (
-            ("5" in q and "min" in q)
-            and ("btc" in q or "eth" in q)
-        ):
-            selected.append(m)
-
-        if len(selected) >= MAX_MARKETS:
-            break
-
-    return selected
-
-# =========================
 # HELPERS
 # =========================
 def get_active_markets():
-    return requests.get(GAMMA_URL, params={"active": "true", "limit": 100}).json()
+    try:
+        res = requests.get(GAMMA_URL, params={"active": "true", "limit": 100})
+        data = res.json()
+
+        print("✅ API response type:", type(data))
+        print("📦 Markets fetched:", len(data))
+
+        return data
+    except Exception as e:
+        print("❌ API ERROR:", e)
+        return []
+
+def find_markets(markets):
+    # FORCE first 4 markets (no filtering issues)
+    selected = markets[:MAX_MARKETS]
+    print("🎯 Selected markets:", len(selected))
+    return selected
 
 def extract_tokens(market):
     tokens = {}
-    for o in market["outcomes"]:
-        name = o["name"].lower()
+    for o in market.get("outcomes", []):
+        name = o.get("name", "").lower()
         if "up" in name or "yes" in name:
-            tokens["UP"] = o["token_id"]
+            tokens["UP"] = o.get("token_id")
         elif "down" in name or "no" in name:
-            tokens["DOWN"] = o["token_id"]
+            tokens["DOWN"] = o.get("token_id")
     return tokens
 
 def get_price(token_id):
@@ -154,18 +151,19 @@ def get_price(token_id):
         if not asks:
             return None
         return float(asks[0]["price"])
-    except:
+    except Exception as e:
+        print("Price error:", e)
         return None
 
 def get_result(market_id):
     try:
         data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
-        for o in data["outcomes"]:
+        for o in data.get("outcomes", []):
             if o.get("winner"):
                 name = o["name"].lower()
                 return "UP" if "up" in name or "yes" in name else "DOWN"
-    except:
-        return None
+    except Exception as e:
+        print("Result error:", e)
     return None
 
 # =========================
@@ -203,21 +201,29 @@ def calculate_bet(price, state):
 def run_bot():
     global bankroll
 
-    print("🚀 Multi-market bot started...")
+    print("🚀 BOT STARTED")
 
     while True:
         try:
             markets = get_active_markets()
+
+            if not markets:
+                print("⚠️ No markets returned")
+                time.sleep(5)
+                continue
+
             selected = find_markets(markets)
 
-            print("Markets found:", len(selected))  # DEBUG
-
             for m in selected:
-                mid = m["id"]
+                mid = m.get("id")
+
+                if not mid:
+                    continue
 
                 if mid not in market_states:
+                    print("➕ Adding market:", m.get("question"))
                     market_states[mid] = {
-                        "question": m["question"],
+                        "question": m.get("question"),
                         "history_prices": [],
                         "history": [],
                         "loss": 0,
@@ -232,6 +238,9 @@ def run_bot():
                 state = market_states[mid]
                 tokens = extract_tokens(m)
 
+                if "UP" not in tokens:
+                    continue
+
                 price = get_price(tokens["UP"])
                 if not price:
                     continue
@@ -245,6 +254,7 @@ def run_bot():
                 if not state["active_trade"]:
                     signal = detect_streak(state["history_prices"])
                     if signal:
+                        print("🔥 SIGNAL:", signal)
                         state["active_trade"] = True
                         state["side"] = signal
 
@@ -258,21 +268,23 @@ def run_bot():
 
                     bet = calculate_bet(trade_price, state)
 
+                    print(f"🧪 BET {state['side']} ${bet:.2f}")
+
                     state["bet"] = bet
                     state["last_trade_time"] = time.time()
 
                     result = get_result(mid)
                     if not result:
+                        print("⏳ Waiting result...")
                         continue
 
                     state["history"].append(result)
-                    if len(state["history"]) > 15:
-                        state["history"].pop(0)
 
                     if result == state["side"]:
                         profit = bet * ((1 - trade_price) / trade_price)
                         bankroll += profit
                         state["profit"] += profit
+                        print("✅ WIN", profit)
 
                         state["loss"] = 0
                         state["step"] = 1
@@ -281,16 +293,12 @@ def run_bot():
                         bankroll -= bet
                         state["loss"] += bet
                         state["step"] += 1
-
-                        if state["step"] > MAX_STEPS:
-                            state["loss"] = 0
-                            state["step"] = 1
-                            state["active_trade"] = False
+                        print("❌ LOSS", bet)
 
             time.sleep(SLEEP_TIME)
 
         except Exception as e:
-            print("Error:", e)
+            print("🔥 LOOP ERROR:", e)
             time.sleep(5)
 
 # =========================
