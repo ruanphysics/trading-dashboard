@@ -9,8 +9,6 @@ from datetime import datetime
 # CONFIG
 # =========================
 ASSETS = ["btc", "eth", "sol", "xrp"]
-
-ROUND_SECONDS = 300
 SLEEP_TIME = 5
 
 # =========================
@@ -28,7 +26,7 @@ app = Flask(__name__)
 TEMPLATE = """
 <meta http-equiv="refresh" content="5">
 
-<h1>📊 Polymarket 5m Bot (Stable)</h1>
+<h1>📊 Polymarket 5m Bot (LIVE)</h1>
 
 <p><b>Bankroll:</b> {{bankroll}}</p>
 
@@ -37,13 +35,12 @@ TEMPLATE = """
 <b>{{a['name']}}</b><br>
 
 Market ID: {{a['market_id']}}<br>
+Slug: {{a['slug']}}<br>
 Price: {{a['price']}}<br>
-Tokens: {{a['tokens']}}<br>
 Status: {{a['status']}}<br>
 
 <br>
 ⏱ Time (UTC): {{a['time']}}<br>
-Ends In: {{a['timer']}}<br>
 
 <br>
 History: {{a['history']}}
@@ -61,63 +58,50 @@ def start_bot():
 
 @app.route("/")
 def home():
-    now, timer = get_timer()
+    now = datetime.utcnow().strftime("%H:%M:%S")
 
     display = []
     for s in asset_states.values():
         display.append({
             "name": s["name"],
             "market_id": s.get("market_id"),
+            "slug": s.get("slug"),
             "price": s.get("price"),
-            "tokens": s.get("tokens"),
             "status": s.get("status"),
             "history": s.get("history"),
-            "time": now,
-            "timer": timer
+            "time": now
         })
 
     return render_template_string(TEMPLATE, bankroll=bankroll, assets=display)
 
 # =========================
-# TIME
-# =========================
-def get_timer():
-    now = datetime.utcnow()
-    seconds = int(now.timestamp())
-    remaining = 300 - (seconds % 300)
-
-    return now.strftime("%H:%M:%S"), f"{remaining//60:02d}:{remaining%60:02d}"
-
-# =========================
 # API HELPERS
 # =========================
-def safe_get_tokens(mid):
+def get_live_markets():
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}")
+        data = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"limit": 200}
+        ).json()
 
-        if r.status_code != 200:
-            return None
+        found = {}
 
-        data = r.json()
+        for m in data:
+            slug = m.get("slug", "").lower()
 
-        tokens = {}
-        for o in data.get("outcomes", []):
-            name = o.get("name", "").lower()
+            for asset in ASSETS:
+                if f"{asset}-updown-5m" in slug:
+                    found[asset] = m
 
-            if "yes" in name:
-                tokens["UP"] = o.get("token_id")
-            elif "no" in name:
-                tokens["DOWN"] = o.get("token_id")
+        return found
 
-        return tokens if tokens else None
+    except Exception as e:
+        print("MARKET FETCH ERROR:", e)
+        return {}
 
-    except:
-        return None
-
-def safe_get_price(token):
+def get_price(token):
     try:
-        r = requests.get(f"https://clob.polymarket.com/books/{token}")
-        data = r.json()
+        data = requests.get(f"https://clob.polymarket.com/books/{token}").json()
 
         asks = data.get("asks", [])
         bids = data.get("bids", [])
@@ -136,10 +120,9 @@ def safe_get_price(token):
 
     return None
 
-def safe_get_result(mid):
+def get_result(mid):
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}")
-        data = r.json()
+        data = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}").json()
 
         for o in data.get("outcomes", []):
             if o.get("winner"):
@@ -151,59 +134,58 @@ def safe_get_result(mid):
     return None
 
 # =========================
-# 🔥 MARKET FINDER (CRITICAL FIX)
-# =========================
-def find_live_market(asset):
-    now = int(time.time())
-    base = now - (now % 300)
-
-    candidates = [
-        base,
-        base - 300,
-        base - 600
-    ]
-
-    for ts in candidates:
-        mid = f"{asset}-updown-5m-{ts}"
-
-        tokens = safe_get_tokens(mid)
-        if tokens:
-            return mid, tokens
-
-    return None, None
-
-# =========================
 # BOT LOOP
 # =========================
 def run_bot():
     global asset_states
 
+    # INIT
     for a in ASSETS:
         asset_states[a] = {
             "name": a.upper(),
             "market_id": None,
+            "slug": None,
             "price": None,
-            "tokens": None,
             "status": "INIT",
             "history": [],
-            "last_resolved": None
+            "last_result": None
         }
 
     while True:
         try:
+            markets = get_live_markets()
+
             for a in ASSETS:
                 s = asset_states[a]
 
-                mid, tokens = find_live_market(a)
+                m = markets.get(a)
 
-                if not mid:
-                    s["status"] = "NO MARKET FOUND"
+                if not m:
+                    s["status"] = "NOT FOUND"
                     continue
 
-                s["market_id"] = mid
-                s["tokens"] = tokens
+                mid = m.get("id")
+                slug = m.get("slug")
 
-                price = safe_get_price(tokens.get("UP"))
+                s["market_id"] = mid
+                s["slug"] = slug
+
+                # TOKENS
+                tokens = {}
+                for o in m.get("outcomes", []):
+                    name = o["name"].lower()
+
+                    if "yes" in name:
+                        tokens["UP"] = o["token_id"]
+                    elif "no" in name:
+                        tokens["DOWN"] = o["token_id"]
+
+                if "UP" not in tokens:
+                    s["status"] = "NO TOKENS"
+                    continue
+
+                # PRICE
+                price = get_price(tokens["UP"])
                 s["price"] = price
 
                 if not price:
@@ -211,27 +193,20 @@ def run_bot():
                 else:
                     s["status"] = "LIVE"
 
-                # ===== RESULT FIX =====
-                try:
-                    ts = int(mid.split("-")[-1])
-                    prev_mid = f"{a}-updown-5m-{ts - 300}"
-                except:
-                    prev_mid = None
+                # RESULT
+                result = get_result(mid)
 
-                if prev_mid:
-                    result = safe_get_result(prev_mid)
+                if result and result != s["last_result"]:
+                    s["last_result"] = result
+                    s["history"].append(result)
 
-                    if result and s["last_resolved"] != prev_mid:
-                        s["last_resolved"] = prev_mid
-                        s["history"].append(result)
-
-                        if len(s["history"]) > 10:
-                            s["history"].pop(0)
+                    if len(s["history"]) > 10:
+                        s["history"].pop(0)
 
             time.sleep(SLEEP_TIME)
 
         except Exception as e:
-            print("🔥 ERROR:", e)
+            print("🔥 LOOP ERROR:", e)
             time.sleep(5)
 
 # =========================
