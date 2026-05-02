@@ -21,16 +21,9 @@ SLEEP_TIME = 10
 
 MAX_MARKETS = 4
 
-# =========================
-# TIMEZONE
-# =========================
 ET = pytz.timezone("US/Eastern")
 
-# =========================
-# GLOBAL BANKROLL
-# =========================
 bankroll = 100.0
-
 market_states = {}
 
 # =========================
@@ -89,10 +82,14 @@ def home():
             "timer": timer
         })
 
-    return render_template_string(TEMPLATE, bankroll=round(bankroll, 2), markets=display)
+    return render_template_string(
+        TEMPLATE,
+        bankroll=round(bankroll, 2),
+        markets=display
+    )
 
 # =========================
-# TIME LOGIC
+# TIME
 # =========================
 def get_round_timer():
     now = datetime.now(ET)
@@ -107,25 +104,37 @@ def get_round_timer():
     mins = seconds // 60
     secs = seconds % 60
 
-    timer = f"{mins:02d}:{secs:02d}"
+    return now.strftime("%H:%M:%S"), f"{mins:02d}:{secs:02d}"
 
-    return now.strftime("%H:%M:%S"), timer
+# =========================
+# MARKET FILTER (SMART)
+# =========================
+def find_markets(markets):
+    selected = []
+
+    for m in markets:
+        q = m["question"].lower()
+
+        # SMART FILTER:
+        # - Must mention time window (5 min / 5 minutes)
+        # - Must be crypto (BTC / ETH)
+        # - Avoid weird/long-term markets
+        if (
+            ("5" in q and "min" in q)
+            and ("btc" in q or "eth" in q)
+        ):
+            selected.append(m)
+
+        if len(selected) >= MAX_MARKETS:
+            break
+
+    return selected
 
 # =========================
 # HELPERS
 # =========================
 def get_active_markets():
     return requests.get(GAMMA_URL, params={"active": "true", "limit": 100}).json()
-
-def find_markets(markets):
-    selected = []
-    for m in markets:
-        q = m["question"].lower()
-        if "5 min" in q and ("up" in q or "down" in q):
-            selected.append(m)
-        if len(selected) >= MAX_MARKETS:
-            break
-    return selected
 
 def extract_tokens(market):
     tokens = {}
@@ -160,17 +169,17 @@ def get_result(market_id):
     return None
 
 # =========================
-# LOGIC
+# STRATEGY
 # =========================
 def detect_streak(history):
     if len(history) < 4:
         return None
 
-    directions = []
+    dirs = []
     for i in range(1, len(history)):
-        directions.append("UP" if history[i] > history[i-1] else "DOWN")
+        dirs.append("UP" if history[i] > history[i-1] else "DOWN")
 
-    last3 = directions[-3:]
+    last3 = dirs[-3:]
 
     if all(d == "DOWN" for d in last3):
         return "UP"
@@ -200,6 +209,8 @@ def run_bot():
         try:
             markets = get_active_markets()
             selected = find_markets(markets)
+
+            print("Markets found:", len(selected))  # DEBUG
 
             for m in selected:
                 mid = m["id"]
@@ -231,14 +242,12 @@ def run_bot():
                 if len(state["history_prices"]) > 5:
                     state["history_prices"].pop(0)
 
-                # ENTRY
                 if not state["active_trade"]:
                     signal = detect_streak(state["history_prices"])
                     if signal:
                         state["active_trade"] = True
                         state["side"] = signal
 
-                # TRADE
                 if state["active_trade"]:
                     if time.time() - state["last_trade_time"] < ROUND_WAIT:
                         continue
