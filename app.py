@@ -139,48 +139,35 @@ def get_active_markets():
         return []
 
 # =========================
-# SMART MARKET SELECTION
+# FINAL TARGETED FILTER
 # =========================
 def find_markets(markets):
-    scored = []
+    targets = ["btc", "eth", "sol", "xrp"]
+    selected = []
 
     for m in markets:
         q = m.get("question", "").lower()
-        outcomes = m.get("outcomes", [])
 
-        if len(outcomes) < 2:
+        if "up or down" not in q:
             continue
 
-        score = 0
+        if "5m" not in q and "5 min" not in q:
+            continue
 
-        if "5 min" in q or "5min" in q:
-            score += 5
-        if "minute" in q:
-            score += 3
+        if not any(t in q for t in targets):
+            continue
 
-        if any(x in q for x in ["up", "down", "above", "below"]):
-            score += 3
+        selected.append(m)
 
-        if any(x in q for x in ["btc", "bitcoin", "eth", "ethereum"]):
-            score += 4
-
-        if any(x in q for x in ["election", "ceasefire", "president", "war"]):
-            score -= 5
-
-        if score > 0:
-            scored.append((score, m))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    selected = [m for _, m in scored[:MAX_MARKETS]]
+        if len(selected) >= MAX_MARKETS:
+            break
 
     if not selected:
-        print("⚠️ No good matches — fallback used")
-        selected = markets[:MAX_MARKETS]
-
-    print("🎯 Selected markets:")
-    for s in selected:
-        print(" -", s.get("question"))
+        print("⚠️ No matching Up/Down markets found")
+    else:
+        print("🎯 PERFECT MATCH MARKETS:")
+        for s in selected:
+            print(" -", s.get("question"))
 
     return selected
 
@@ -265,6 +252,10 @@ def run_bot():
                 continue
 
             selected = find_markets(markets)
+
+            if not selected:
+                time.sleep(5)
+                continue
 
             for m in selected:
                 mid = m.get("id")
