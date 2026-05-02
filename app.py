@@ -68,7 +68,7 @@ Ends In: {{m['timer']}}<br>
 def start_bot_once():
     global bot_started
     if not bot_started:
-        print("🚀 STARTING BOT THREAD (Gunicorn-safe)")
+        print("🚀 STARTING BOT THREAD")
         threading.Thread(target=run_bot, daemon=True).start()
         bot_started = True
 
@@ -135,9 +135,39 @@ def get_active_markets():
         print("❌ API ERROR:", e)
         return []
 
+# =========================
+# SMART FILTER + FALLBACK
+# =========================
 def find_markets(markets):
-    selected = markets[:MAX_MARKETS]
-    print("🎯 Selected markets:", len(selected))
+    selected = []
+
+    for m in markets:
+        q = m.get("question", "").lower()
+        outcomes = m.get("outcomes", [])
+
+        # must have at least 2 outcomes
+        if len(outcomes) < 2:
+            continue
+
+        # must look like short-term (5 min)
+        if "min" not in q and "minute" not in q:
+            continue
+
+        # prefer crypto markets
+        if not any(x in q for x in ["btc", "bitcoin", "eth", "ethereum"]):
+            continue
+
+        selected.append(m)
+
+        if len(selected) >= MAX_MARKETS:
+            break
+
+    # FALLBACK if nothing found
+    if len(selected) == 0:
+        print("⚠️ No filtered markets — using fallback")
+        selected = markets[:MAX_MARKETS]
+
+    print("🎯 Markets selected:", len(selected))
     return selected
 
 def extract_tokens(market):
@@ -279,7 +309,6 @@ def run_bot():
 
                     result = get_result(mid)
                     if not result:
-                        print("⏳ Waiting result...")
                         continue
 
                     state["history"].append(result)
