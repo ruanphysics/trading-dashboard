@@ -3,15 +3,11 @@ import requests
 import os
 import threading
 from flask import Flask
-from py_clob_client.client import ClobClient
 
 # =========================
 # CONFIG
 # =========================
-API_URL = "https://clob.polymarket.com"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
-
-CHAIN_ID = 137
 
 BASE_BET = 1.0
 TARGET_PROFIT = 0.30
@@ -33,11 +29,6 @@ current_side = None
 
 price_history = []
 MAX_HISTORY = 5
-
-# =========================
-# CLIENT (READ-ONLY USAGE)
-# =========================
-client = ClobClient(API_URL, chain_id=CHAIN_ID)
 
 # =========================
 # FLASK APP
@@ -72,14 +63,24 @@ def extract_tokens(market):
     return tokens
 
 # =========================
-# PRICE + STREAK
+# PRICE (NO CLIENT)
 # =========================
 def get_price(token_id):
-    book = client.get_order_book(token_id)
-    if not book["asks"]:
-        return None
-    return float(book["asks"][0]["price"])
+    try:
+        url = f"https://clob.polymarket.com/books/{token_id}"
+        data = requests.get(url).json()
 
+        asks = data.get("asks", [])
+        if not asks:
+            return None
+
+        return float(asks[0]["price"])
+    except:
+        return None
+
+# =========================
+# PRICE + STREAK
+# =========================
 def update_price(price):
     global price_history
     price_history.append(price)
@@ -112,7 +113,7 @@ def detect_streak():
 def calculate_bet(price):
     global current_loss, step
 
-    if price <= 0 or price >= 1:
+    if price is None or price <= 0 or price >= 1:
         return BASE_BET
 
     required = current_loss + TARGET_PROFIT
@@ -133,15 +134,18 @@ def place_order(price, bet, side):
 # RESULT (REAL DATA)
 # =========================
 def get_result(market_id):
-    data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
+    try:
+        data = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}").json()
 
-    for o in data["outcomes"]:
-        if o.get("winner"):
-            name = o["name"].lower()
-            if "up" in name or "yes" in name:
-                return "UP"
-            else:
-                return "DOWN"
+        for o in data["outcomes"]:
+            if o.get("winner"):
+                name = o["name"].lower()
+                if "up" in name or "yes" in name:
+                    return "UP"
+                else:
+                    return "DOWN"
+    except:
+        return None
 
     return None
 
@@ -196,6 +200,7 @@ def run_bot():
             market = find_market(markets)
 
             if not market:
+                print("❌ No market found")
                 time.sleep(5)
                 continue
 
@@ -205,6 +210,7 @@ def run_bot():
             price = get_price(ref_token)
 
             if price is None:
+                time.sleep(2)
                 continue
 
             update_price(price)
@@ -228,6 +234,7 @@ def run_bot():
             price = get_price(token_id)
 
             if price is None:
+                time.sleep(2)
                 continue
 
             bet = calculate_bet(price)
