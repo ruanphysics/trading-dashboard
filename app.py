@@ -28,6 +28,7 @@ ET = pytz.timezone("US/Eastern")
 # =========================
 bankroll = 100.0
 market_states = {}
+bot_started = False
 
 # =========================
 # FLASK
@@ -35,7 +36,7 @@ market_states = {}
 app = Flask(__name__)
 
 TEMPLATE = """
-<h1>📊 Multi-Market Simulation (DEBUG MODE)</h1>
+<h1>📊 Multi-Market Simulation</h1>
 
 <p><b>Total Bankroll:</b> {{bankroll}}</p>
 <p><b>Markets Loaded:</b> {{count}}</p>
@@ -62,6 +63,14 @@ Ends In: {{m['timer']}}<br>
 </div>
 {% endfor %}
 """
+
+@app.before_request
+def start_bot_once():
+    global bot_started
+    if not bot_started:
+        print("🚀 STARTING BOT THREAD (Gunicorn-safe)")
+        threading.Thread(target=run_bot, daemon=True).start()
+        bot_started = True
 
 @app.route("/")
 def home():
@@ -119,16 +128,14 @@ def get_active_markets():
         res = requests.get(GAMMA_URL, params={"active": "true", "limit": 100})
         data = res.json()
 
-        print("✅ API response type:", type(data))
         print("📦 Markets fetched:", len(data))
-
         return data
+
     except Exception as e:
         print("❌ API ERROR:", e)
         return []
 
 def find_markets(markets):
-    # FORCE first 4 markets (no filtering issues)
     selected = markets[:MAX_MARKETS]
     print("🎯 Selected markets:", len(selected))
     return selected
@@ -151,8 +158,7 @@ def get_price(token_id):
         if not asks:
             return None
         return float(asks[0]["price"])
-    except Exception as e:
-        print("Price error:", e)
+    except:
         return None
 
 def get_result(market_id):
@@ -162,8 +168,8 @@ def get_result(market_id):
             if o.get("winner"):
                 name = o["name"].lower()
                 return "UP" if "up" in name or "yes" in name else "DOWN"
-    except Exception as e:
-        print("Result error:", e)
+    except:
+        return None
     return None
 
 # =========================
@@ -208,7 +214,6 @@ def run_bot():
             markets = get_active_markets()
 
             if not markets:
-                print("⚠️ No markets returned")
                 time.sleep(5)
                 continue
 
@@ -216,7 +221,6 @@ def run_bot():
 
             for m in selected:
                 mid = m.get("id")
-
                 if not mid:
                     continue
 
@@ -300,10 +304,3 @@ def run_bot():
         except Exception as e:
             print("🔥 LOOP ERROR:", e)
             time.sleep(5)
-
-# =========================
-# START
-# =========================
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
