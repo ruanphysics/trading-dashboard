@@ -7,8 +7,6 @@ from flask import Flask, render_template_string
 # =========================
 # CONFIG
 # =========================
-ASSETS = ["btc", "eth", "sol", "xrp"]
-
 ROUND = 300
 SLEEP = 2
 
@@ -22,6 +20,16 @@ MAX_DOWN_PRICE = 0.55
 ENTRY_WINDOW = 60
 
 # =========================
+# 🔥 PASTE YOUR LINKS HERE
+# =========================
+MARKETS = {
+    "BTC": "https://polymarket.com/event/btc-updown-5m-1777748400",
+    "ETH": "https://polymarket.com/event/eth-updown-5m-1777748400",
+    "SOL": "https://polymarket.com/event/sol-updown-5m-1777748400",
+    "XRP": "https://polymarket.com/event/xrp-updown-5m-1777748400",
+}
+
+# =========================
 bankroll = 100.0
 states = {}
 
@@ -32,7 +40,7 @@ app = Flask(__name__)
 # =========================
 TEMPLATE = """
 <meta http-equiv="refresh" content="3">
-<h2>📊 AUTO TOKEN BOT</h2>
+<h2>📊 FINAL BOT (AUTO TOKENS)</h2>
 <h3>Bankroll: {{bankroll}}</h3>
 
 {% for s in data %}
@@ -60,36 +68,27 @@ def home():
 # =========================
 # HELPERS
 # =========================
-def get_event(asset):
-    try:
-        data = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"limit": 50}
-        ).json()
+def get_slug(url):
+    return url.split("/")[-1]
 
-        for e in data:
-            slug = e.get("slug","").lower()
-            if f"{asset}-updown-5m" in slug:
-                return e
+def get_tokens_from_slug(slug):
+    try:
+        data = requests.get(f"https://gamma-api.polymarket.com/events/{slug}").json()
+
+        for m in data.get("markets", []):
+            tokens = {}
+            for o in m.get("outcomes", []):
+                name = o["name"].lower()
+                if "yes" in name:
+                    tokens["UP"] = o["token_id"]
+                elif "no" in name:
+                    tokens["DOWN"] = o["token_id"]
+
+            if "UP" in tokens and "DOWN" in tokens:
+                return tokens
     except:
         pass
-    return None
 
-def get_tokens(asset):
-    event = get_event(asset)
-    if not event:
-        return None
-
-    for m in event.get("markets", []):
-        tokens = {}
-        for o in m.get("outcomes", []):
-            name = o["name"].lower()
-            if "yes" in name:
-                tokens["UP"] = o["token_id"]
-            elif "no" in name:
-                tokens["DOWN"] = o["token_id"]
-        if tokens:
-            return tokens
     return None
 
 def get_price(token):
@@ -128,14 +127,14 @@ def calc(price, loss):
     return min(max(raw, BASE_BET), MAX_BET)
 
 # =========================
-# BOT
+# BOT LOOP
 # =========================
 def run():
     global bankroll
 
-    for a in ASSETS:
-        states[a] = {
-            "name": a.upper(),
+    for name in MARKETS:
+        states[name] = {
+            "name": name,
             "price": None,
             "history": [],
             "side": None,
@@ -155,19 +154,21 @@ def run():
         try:
             t = timer()
 
-            for a in ASSETS:
-                s = states[a]
+            for name, url in MARKETS.items():
+                s = states[name]
 
-                # auto refresh tokens
+                slug = get_slug(url)
+
+                # refresh tokens every new round
                 if not s["tokens"] or t > 290:
-                    s["tokens"] = get_tokens(a)
+                    s["tokens"] = get_tokens_from_slug(slug)
 
                 if not s["tokens"]:
                     s["status"] = "NO TOKENS"
                     continue
 
                 price = get_price(s["tokens"]["UP"])
-                s["price"] = round(price,3) if price else None
+                s["price"] = round(price, 3) if price else None
 
                 current_round = int(time.time() // ROUND)
 
@@ -178,66 +179,66 @@ def run():
 
                         if final:
                             win = (
-                                (s["side"]=="UP" and final > s["entry"]) or
-                                (s["side"]=="DOWN" and final < s["entry"])
+                                (s["side"] == "UP" and final > s["entry"]) or
+                                (s["side"] == "DOWN" and final < s["entry"])
                             )
 
                             if win:
                                 profit = s["bet"] * ((1 - s["entry"]) / s["entry"])
                                 bankroll += profit
-                                s["loss"]=0
-                                s["step"]=1
-                                s["status"]="WIN ✅"
+                                s["loss"] = 0
+                                s["step"] = 1
+                                s["status"] = "WIN ✅"
                             else:
                                 bankroll -= s["bet"]
-                                s["loss"]+=s["bet"]
-                                s["step"]+=1
-                                s["status"]="LOSS ❌"
+                                s["loss"] += s["bet"]
+                                s["step"] += 1
+                                s["status"] = "LOSS ❌"
 
-                                if s["step"]>MAX_STEPS:
-                                    s["loss"]=0
-                                    s["step"]=1
-                                    s["status"]="RESET ⚠️"
+                                if s["step"] > MAX_STEPS:
+                                    s["loss"] = 0
+                                    s["step"] = 1
+                                    s["status"] = "RESET ⚠️"
 
-                    # history
+                    # update history
                     if s["start_price"] and price:
-                        s["history"].append("UP" if price>s["start_price"] else "DOWN")
-                        if len(s["history"])>10:
+                        s["history"].append("UP" if price > s["start_price"] else "DOWN")
+                        if len(s["history"]) > 10:
                             s["history"].pop(0)
 
-                    s["start_price"]=price
-                    s["active"]=False
-                    s["entry"]=None
+                    s["start_price"] = price
+                    s["active"] = False
+                    s["entry"] = None
 
-                # entry
-                if not s["active"] and price and t<=ENTRY_WINDOW:
+                # ENTRY LOGIC
+                if not s["active"] and price and t <= ENTRY_WINDOW:
                     sig = detect(s["history"])
 
-                    if sig=="UP" and price<=MIN_UP_PRICE:
+                    if sig == "UP" and price <= MIN_UP_PRICE:
                         b = calc(price, s["loss"])
-                        s["side"]="UP"
-                        s["entry"]=price
-                        s["bet"]=round(b,2)
-                        s["active"]=True
-                        s["status"]="ENTER UP 🔵"
+                        s["side"] = "UP"
+                        s["entry"] = price
+                        s["bet"] = round(b, 2)
+                        s["active"] = True
+                        s["status"] = "ENTER UP 🔵"
 
-                    elif sig=="DOWN" and price>=MAX_DOWN_PRICE:
+                    elif sig == "DOWN" and price >= MAX_DOWN_PRICE:
                         b = calc(price, s["loss"])
-                        s["side"]="DOWN"
-                        s["entry"]=price
-                        s["bet"]=round(b,2)
-                        s["active"]=True
-                        s["status"]="ENTER DOWN 🔴"
+                        s["side"] = "DOWN"
+                        s["entry"] = price
+                        s["bet"] = round(b, 2)
+                        s["active"] = True
+                        s["status"] = "ENTER DOWN 🔴"
 
                     else:
-                        s["status"]="WAITING PRICE"
+                        s["status"] = "WAITING PRICE"
 
                 elif not s["active"]:
-                    s["status"]="WAITING PATTERN"
+                    s["status"] = "WAITING PATTERN"
 
-                s["timer"]=f"{t//60:02d}:{t%60:02d}"
+                s["timer"] = f"{t//60:02d}:{t%60:02d}"
 
-            last_round = int(time.time()//ROUND)
+            last_round = int(time.time() // ROUND)
             time.sleep(SLEEP)
 
         except Exception as e:
