@@ -64,6 +64,9 @@ Ends In: {{m['timer']}}<br>
 {% endfor %}
 """
 
+# =========================
+# START BOT (GUNICORN SAFE)
+# =========================
 @app.before_request
 def start_bot_once():
     global bot_started
@@ -121,7 +124,7 @@ def get_round_timer():
     return now.strftime("%H:%M:%S"), f"{mins:02d}:{secs:02d}"
 
 # =========================
-# HELPERS
+# API
 # =========================
 def get_active_markets():
     try:
@@ -136,40 +139,54 @@ def get_active_markets():
         return []
 
 # =========================
-# SMART FILTER + FALLBACK
+# SMART MARKET SELECTION
 # =========================
 def find_markets(markets):
-    selected = []
+    scored = []
 
     for m in markets:
         q = m.get("question", "").lower()
         outcomes = m.get("outcomes", [])
 
-        # must have at least 2 outcomes
         if len(outcomes) < 2:
             continue
 
-        # must look like short-term (5 min)
-        if "min" not in q and "minute" not in q:
-            continue
+        score = 0
 
-        # prefer crypto markets
-        if not any(x in q for x in ["btc", "bitcoin", "eth", "ethereum"]):
-            continue
+        if "5 min" in q or "5min" in q:
+            score += 5
+        if "minute" in q:
+            score += 3
 
-        selected.append(m)
+        if any(x in q for x in ["up", "down", "above", "below"]):
+            score += 3
 
-        if len(selected) >= MAX_MARKETS:
-            break
+        if any(x in q for x in ["btc", "bitcoin", "eth", "ethereum"]):
+            score += 4
 
-    # FALLBACK if nothing found
-    if len(selected) == 0:
-        print("⚠️ No filtered markets — using fallback")
+        if any(x in q for x in ["election", "ceasefire", "president", "war"]):
+            score -= 5
+
+        if score > 0:
+            scored.append((score, m))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    selected = [m for _, m in scored[:MAX_MARKETS]]
+
+    if not selected:
+        print("⚠️ No good matches — fallback used")
         selected = markets[:MAX_MARKETS]
 
-    print("🎯 Markets selected:", len(selected))
+    print("🎯 Selected markets:")
+    for s in selected:
+        print(" -", s.get("question"))
+
     return selected
 
+# =========================
+# HELPERS
+# =========================
 def extract_tokens(market):
     tokens = {}
     for o in market.get("outcomes", []):
