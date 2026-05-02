@@ -5,21 +5,30 @@ import threading
 from flask import Flask, render_template_string
 from datetime import datetime
 
+# =========================
+# CONFIG
+# =========================
 ASSETS = ["btc", "eth", "sol", "xrp"]
 
 ROUND_SECONDS = 300
 SLEEP_TIME = 5
 
+# =========================
+# STATE
+# =========================
 bankroll = 100.0
 asset_states = {}
 bot_started = False
 
+# =========================
+# FLASK
+# =========================
 app = Flask(__name__)
 
 TEMPLATE = """
 <meta http-equiv="refresh" content="5">
 
-<h1>📊 DEBUG BOT</h1>
+<h1>📊 Polymarket 5m Bot (Stable)</h1>
 
 <p><b>Bankroll:</b> {{bankroll}}</p>
 
@@ -32,9 +41,11 @@ Price: {{a['price']}}<br>
 Tokens: {{a['tokens']}}<br>
 Status: {{a['status']}}<br>
 
-Time: {{a['time']}}<br>
-Timer: {{a['timer']}}<br>
+<br>
+⏱ Time (UTC): {{a['time']}}<br>
+Ends In: {{a['timer']}}<br>
 
+<br>
 History: {{a['history']}}
 </div>
 {% endfor %}
@@ -44,6 +55,7 @@ History: {{a['history']}}
 def start_bot():
     global bot_started
     if not bot_started:
+        print("🚀 BOT STARTING")
         threading.Thread(target=run_bot, daemon=True).start()
         bot_started = True
 
@@ -55,7 +67,7 @@ def home():
     for s in asset_states.values():
         display.append({
             "name": s["name"],
-            "market_id": s["market_id"],
+            "market_id": s.get("market_id"),
             "price": s.get("price"),
             "tokens": s.get("tokens"),
             "status": s.get("status"),
@@ -76,17 +88,12 @@ def get_timer():
 
     return now.strftime("%H:%M:%S"), f"{remaining//60:02d}:{remaining%60:02d}"
 
-def current_ts():
-    now = int(time.time())
-    return now - (now % ROUND_SECONDS)
-
 # =========================
-# API
+# API HELPERS
 # =========================
 def safe_get_tokens(mid):
     try:
-        url = f"https://gamma-api.polymarket.com/markets/{mid}"
-        r = requests.get(url)
+        r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}")
 
         if r.status_code != 200:
             return None
@@ -115,8 +122,12 @@ def safe_get_price(token):
         asks = data.get("asks", [])
         bids = data.get("bids", [])
 
+        if asks and bids:
+            return (float(asks[0]["price"]) + float(bids[0]["price"])) / 2
+
         if asks:
             return float(asks[0]["price"])
+
         if bids:
             return float(bids[0]["price"])
 
@@ -127,7 +138,8 @@ def safe_get_price(token):
 
 def safe_get_result(mid):
     try:
-        data = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}").json()
+        r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}")
+        data = r.json()
 
         for o in data.get("outcomes", []):
             if o.get("winner"):
@@ -139,6 +151,28 @@ def safe_get_result(mid):
     return None
 
 # =========================
+# 🔥 MARKET FINDER (CRITICAL FIX)
+# =========================
+def find_live_market(asset):
+    now = int(time.time())
+    base = now - (now % 300)
+
+    candidates = [
+        base,
+        base - 300,
+        base - 600
+    ]
+
+    for ts in candidates:
+        mid = f"{asset}-updown-5m-{ts}"
+
+        tokens = safe_get_tokens(mid)
+        if tokens:
+            return mid, tokens
+
+    return None, None
+
+# =========================
 # BOT LOOP
 # =========================
 def run_bot():
@@ -147,59 +181,57 @@ def run_bot():
     for a in ASSETS:
         asset_states[a] = {
             "name": a.upper(),
-            "market_id": "",
+            "market_id": None,
             "price": None,
             "tokens": None,
             "status": "INIT",
-            "history": []
+            "history": [],
+            "last_resolved": None
         }
 
     while True:
         try:
-            ts = current_ts()
-
             for a in ASSETS:
                 s = asset_states[a]
 
-                current_mid = f"{a}-updown-5m-{ts}"
-                prev_mid = f"{a}-updown-5m-{ts - 300}"
+                mid, tokens = find_live_market(a)
 
-                s["market_id"] = current_mid
-
-                # TRY CURRENT + PREVIOUS (important fix)
-                tokens = safe_get_tokens(current_mid)
-
-                if not tokens:
-                    tokens = safe_get_tokens(prev_mid)
-
-                s["tokens"] = tokens
-
-                if not tokens:
-                    s["status"] = "NO TOKENS"
+                if not mid:
+                    s["status"] = "NO MARKET FOUND"
                     continue
+
+                s["market_id"] = mid
+                s["tokens"] = tokens
 
                 price = safe_get_price(tokens.get("UP"))
                 s["price"] = price
 
                 if not price:
                     s["status"] = "NO PRICE"
-                    continue
+                else:
+                    s["status"] = "LIVE"
 
-                s["status"] = "LIVE"
+                # ===== RESULT FIX =====
+                try:
+                    ts = int(mid.split("-")[-1])
+                    prev_mid = f"{a}-updown-5m-{ts - 300}"
+                except:
+                    prev_mid = None
 
-                # CHECK RESULT (previous round)
-                result = safe_get_result(prev_mid)
+                if prev_mid:
+                    result = safe_get_result(prev_mid)
 
-                if result and (not s["history"] or s["history"][-1] != result):
-                    s["history"].append(result)
+                    if result and s["last_resolved"] != prev_mid:
+                        s["last_resolved"] = prev_mid
+                        s["history"].append(result)
 
-                    if len(s["history"]) > 10:
-                        s["history"].pop(0)
+                        if len(s["history"]) > 10:
+                            s["history"].pop(0)
 
             time.sleep(SLEEP_TIME)
 
         except Exception as e:
-            print("ERROR:", e)
+            print("🔥 ERROR:", e)
             time.sleep(5)
 
 # =========================
