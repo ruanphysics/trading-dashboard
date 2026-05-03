@@ -19,7 +19,11 @@ symbols = {
     "solana": "SOL-USD"
 }
 
-stake_levels = [4, 8, 20, 44, 100]
+# ✅ UPDATED LADDER
+stake_levels = [
+    0.25, 0.38, 0.56, 0.84, 1.27, 1.90, 2.85,
+    4.27, 6.41, 9.61, 14.42, 21.62, 32.44
+]
 
 STATE_FILE = "state.json"
 
@@ -170,23 +174,24 @@ def run_market(m):
 
                 if outcome != "FLAT":
                     s["history"].append(outcome)
-                    if len(s["history"]) > 7:
+
+                    # ✅ UPDATED HISTORY LIMIT
+                    if len(s["history"]) > 20:
                         s["history"].pop(0)
 
                 # STREAK
                 streak_dir, streak_count = get_streak(s["history"])
 
-                # UPDATE MAX STREAK (PERSISTENT)
+                # MAX STREAK
                 if streak_count > s["max_streak"]:
                     s["max_streak"] = streak_count
 
-                # SIGNAL
-                if streak_count >= 3:
+                # ✅ UPDATED SIGNAL (2 STREAK)
+                if streak_count >= 2:
                     s["signal"] = "DOWN" if streak_dir == "UP" else "UP"
                 else:
                     s["signal"] = None
 
-                # UNLOCK WAIT
                 if s["waiting_for_pattern"] and s["signal"]:
                     s["waiting_for_pattern"] = False
 
@@ -200,12 +205,14 @@ def run_market(m):
                     )
 
                     if win:
-                        profit = prev_bet * 0.75
+                        # ✅ POLYMARKET STYLE (0.5 ENTRY)
+                        profit = prev_bet
+
                         with bankroll_lock:
                             bankroll += profit
                         s["profit"] += profit
 
-                        # RESET (NO max_streak reset)
+                        # RESET (KEEP MAX STREAK)
                         s["in_trade"] = False
                         s["waiting_for_pattern"] = True
                         s["trade_direction"] = None
@@ -217,6 +224,7 @@ def run_market(m):
 
                     else:
                         loss = prev_bet
+
                         with bankroll_lock:
                             bankroll -= loss
                         s["profit"] -= loss
@@ -224,7 +232,6 @@ def run_market(m):
                         s["step"] += 1
 
                         if s["step"] >= len(stake_levels):
-                            # FINAL LOSS RESET (NO max_streak reset)
                             s["in_trade"] = False
                             s["waiting_for_pattern"] = True
                             s["trade_direction"] = None
@@ -280,10 +287,9 @@ def data():
     })
 
 # =========================
-# UI
+# UI (UNCHANGED)
 # =========================
-HTML = """
-<html>
+HTML = """<html>
 <head>
 <script>
 function formatHistory(arr){
