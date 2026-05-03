@@ -19,11 +19,8 @@ symbols = {
     "solana": "SOL-USD"
 }
 
-# ✅ UPDATED LADDER
-stake_levels = [
-    0.25, 0.38, 0.56, 0.84, 1.27, 1.90, 2.85,
-    4.27, 6.41, 9.61, 14.42, 21.62, 32.44
-]
+# ✅ UPDATED TRUE RECOVERY LADDER
+stake_levels = [0.25, 0.5, 1, 2, 4, 8, 16, 32, 64]
 
 STATE_FILE = "state.json"
 
@@ -175,18 +172,16 @@ def run_market(m):
                 if outcome != "FLAT":
                     s["history"].append(outcome)
 
-                    # ✅ UPDATED HISTORY LIMIT
                     if len(s["history"]) > 20:
                         s["history"].pop(0)
 
                 # STREAK
                 streak_dir, streak_count = get_streak(s["history"])
 
-                # MAX STREAK
                 if streak_count > s["max_streak"]:
                     s["max_streak"] = streak_count
 
-                # ✅ UPDATED SIGNAL (2 STREAK)
+                # SIGNAL (2-STREAK)
                 if streak_count >= 2:
                     s["signal"] = "DOWN" if streak_dir == "UP" else "UP"
                 else:
@@ -205,14 +200,13 @@ def run_market(m):
                     )
 
                     if win:
-                        # ✅ POLYMARKET STYLE (0.5 ENTRY)
+                        # ✅ POLYMARKET 0.50 ENTRY
                         profit = prev_bet
 
                         with bankroll_lock:
                             bankroll += profit
                         s["profit"] += profit
 
-                        # RESET (KEEP MAX STREAK)
                         s["in_trade"] = False
                         s["waiting_for_pattern"] = True
                         s["trade_direction"] = None
@@ -251,7 +245,6 @@ def run_market(m):
                     s["bet"] = stake_levels[0]
                     s["pending"] = True
 
-                # UPDATE BET
                 if s["in_trade"]:
                     s["bet"] = stake_levels[s["step"]]
 
